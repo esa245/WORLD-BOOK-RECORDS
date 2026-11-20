@@ -1,0 +1,6 @@
+{
+  "name": "World Book Records",
+  "description": "Every Book Makes History. Discover remarkable books, meet the minds behind them, and share your stories with a global reading community.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
