@@ -23,7 +23,9 @@ import {
   InfoPageItem,
   INITIAL_BOOKS,
   LITERARY_RECORDS,
+  MilestoneRecord,
 } from '@/data/library';
+import {supabase} from '@/lib/supabase';
 
 type FilterOption = 'All' | BookCategory | BookAccessType;
 type AuthModalMode = 'login' | 'signup' | 'publish';
@@ -44,8 +46,77 @@ const COVER_GRADIENTS: Record<BookCoverVariant, string> = {
   c4: 'bg-[linear-gradient(140deg,#3d3a20,#15160c)]',
 };
 
+interface DbBookRow {
+  id: string;
+  title: string;
+  title_line_1: string;
+  title_line_2: string;
+  author_name: string;
+  category: BookCategory;
+  access_type: BookAccessType;
+  price_label: string;
+  cover_variant: BookCoverVariant;
+  cover_kicker: string;
+  cover_footer: string;
+  pages: number;
+  published_year: number;
+  synopsis: string;
+  excerpt: string;
+}
+
+interface DbAuthorRow {
+  id: string;
+  initials: string;
+  name: string;
+  verified: boolean;
+  country: string;
+  genre: string;
+  published_count: number;
+  bio: string;
+}
+
+interface DbRecordRow {
+  record_number: string;
+  title: string;
+  description: string;
+}
+
+function mapDbBook(row: DbBookRow): BookItem {
+  return {
+    id: row.id,
+    title: row.title,
+    titleLines: [row.title_line_1, row.title_line_2],
+    author: row.author_name,
+    category: row.category,
+    type: row.access_type,
+    priceLabel: row.price_label,
+    coverVariant: row.cover_variant,
+    coverKicker: row.cover_kicker,
+    coverFooter: row.cover_footer,
+    pages: row.pages,
+    publishedYear: row.published_year,
+    synopsis: row.synopsis,
+    excerpt: row.excerpt,
+  };
+}
+
+function mapDbAuthor(row: DbAuthorRow): AuthorItem {
+  return {
+    id: row.id,
+    initials: row.initials,
+    name: row.name,
+    verified: row.verified,
+    country: row.country,
+    genre: row.genre,
+    publishedCount: row.published_count,
+    bio: row.bio,
+  };
+}
+
 export default function WorldBookRecords() {
   const [books, setBooks] = useState<BookItem[]>(INITIAL_BOOKS);
+  const [authors, setAuthors] = useState<AuthorItem[]>(AUTHORS);
+  const [records, setRecords] = useState<MilestoneRecord[]>(LITERARY_RECORDS);
   const [searchQuery, setSearchQuery] = useState('');
   const [activeFilter, setActiveFilter] = useState<FilterOption>('All');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -58,6 +129,7 @@ export default function WorldBookRecords() {
 
   // Account & Publish form state
   const [signedInUser, setSignedInUser] = useState<{
+    id?: string;
     name: string;
     role: string;
   } | null>(null);
@@ -71,6 +143,8 @@ export default function WorldBookRecords() {
   const [bookCategoryInput, setBookCategoryInput] = useState<BookCategory>('Fiction');
   const [bookAccessInput, setBookAccessInput] = useState<BookAccessType>('Free');
   const [bookPriceInput, setBookPriceInput] = useState('$4.99');
+  const [submitting, setSubmitting] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
   const [feedbackBanner, setFeedbackBanner] = useState<string | null>(null);
 
   useEffect(() => {
@@ -93,6 +167,98 @@ export default function WorldBookRecords() {
     return () => clearTimeout(timer);
   }, [feedbackBanner]);
 
+  // Sync data and auth session with Supabase when configured
+  useEffect(() => {
+    const client = supabase;
+    if (!client) return;
+
+    let isMounted = true;
+
+    const loadCatalog = async () => {
+      try {
+        const [booksRes, authorsRes, recordsRes] = await Promise.all([
+          client
+            .from('books')
+            .select('*')
+            .order('created_at', {ascending: false}),
+          client
+            .from('authors')
+            .select('*')
+            .order('published_count', {ascending: false}),
+          client
+            .from('literary_records')
+            .select('*')
+            .order('sort_order', {ascending: true}),
+        ]);
+
+        if (!isMounted) return;
+
+        if (!booksRes.error && booksRes.data && booksRes.data.length > 0) {
+          setBooks((booksRes.data as DbBookRow[]).map(mapDbBook));
+        }
+        if (!authorsRes.error && authorsRes.data && authorsRes.data.length > 0) {
+          setAuthors((authorsRes.data as DbAuthorRow[]).map(mapDbAuthor));
+        }
+        if (!recordsRes.error && recordsRes.data && recordsRes.data.length > 0) {
+          setRecords(
+            (recordsRes.data as DbRecordRow[]).map((r) => ({
+              number: r.record_number,
+              title: r.title,
+              description: r.description,
+            })),
+          );
+        }
+      } catch {
+        // Keep initial curated catalog if tables are not yet initialized
+      }
+    };
+
+    const syncSession = async () => {
+      const {data} = await client.auth.getSession();
+      if (!isMounted) return;
+      const user = data.session?.user;
+      if (user) {
+        setSignedInUser({
+          id: user.id,
+          name:
+            (user.user_metadata?.full_name as string | undefined) ||
+            user.email?.split('@')[0] ||
+            'Member',
+          role:
+            (user.user_metadata?.account_role as string | undefined) ||
+            'Reader account',
+        });
+      }
+    };
+
+    loadCatalog();
+    syncSession();
+
+    const {data: authSub} = client.auth.onAuthStateChange((_event, session) => {
+      if (!isMounted) return;
+      const user = session?.user;
+      if (user) {
+        setSignedInUser({
+          id: user.id,
+          name:
+            (user.user_metadata?.full_name as string | undefined) ||
+            user.email?.split('@')[0] ||
+            'Member',
+          role:
+            (user.user_metadata?.account_role as string | undefined) ||
+            'Reader account',
+        });
+      } else {
+        setSignedInUser(null);
+      }
+    });
+
+    return () => {
+      isMounted = false;
+      authSub.subscription.unsubscribe();
+    };
+  }, []);
+
   const filteredBooks = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     return books.filter((book) => {
@@ -108,6 +274,7 @@ export default function WorldBookRecords() {
   }, [books, searchQuery, activeFilter]);
 
   const openAuthModal = (mode: AuthModalMode) => {
+    setFormError(null);
     setAuthModalMode(mode);
     setMobileMenuOpen(false);
     if (mode === 'publish') {
@@ -115,57 +282,230 @@ export default function WorldBookRecords() {
     }
   };
 
-  const handleFormSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    const displayName =
-      fullName.trim() || email.split('@')[0] || 'Author';
-
-    if (authModalMode === 'publish' && bookTitleInput.trim()) {
-      const words = bookTitleInput.trim().split(/\s+/);
-      const splitIdx = Math.ceil(words.length / 2);
-      const line1 = words.slice(0, splitIdx).join(' ');
-      const line2 = words.slice(splitIdx).join(' ') || 'Edition';
-      const variants: BookCoverVariant[] = ['c1', 'c2', 'c3', 'c4'];
-      const variant = variants[books.length % variants.length];
-      const priceLabel =
-        bookAccessInput === 'Free' ? 'Free' : bookPriceInput.trim() || '$4.99';
-
-      const newBook: BookItem = {
-        id: `book-${Date.now()}`,
-        titleLines: [line1, line2],
-        title: bookTitleInput.trim(),
-        author: displayName,
-        category: bookCategoryInput,
-        type: bookAccessInput,
-        priceLabel,
-        coverVariant: variant,
-        coverKicker: 'WORLD BOOK RECORDS',
-        coverFooter: `BY ${displayName.toUpperCase()}`,
-        pages: 210,
-        publishedYear: 2026,
-        synopsis: `Published to the World Book Records library by ${displayName}.`,
-        excerpt:
-          'Every story begins with a single page shared openly with readers across borders.',
-      };
-
-      setBooks((prev) => [newBook, ...prev]);
-      setSignedInUser({name: displayName, role: 'Author account'});
-      setFeedbackBanner(
-        `"${newBook.title}" has been added to the World Book Records library.`,
-      );
-      setBookTitleInput('');
-    } else if (authModalMode === 'login') {
-      setSignedInUser({name: displayName, role: accountType});
-      setFeedbackBanner(`Signed in as ${displayName}.`);
-    } else {
-      setSignedInUser({name: displayName, role: accountType});
-      setFeedbackBanner(
-        `Welcome to World Book Records, ${displayName} (${accountType}).`,
-      );
+  const handleSignOut = async () => {
+    if (supabase) {
+      await supabase.auth.signOut();
     }
+    setSignedInUser(null);
+    setFeedbackBanner('Signed out of your account.');
+  };
 
-    setAuthModalMode(null);
-    setPassword('');
+  const handleFormSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setFormError(null);
+    setSubmitting(true);
+
+    try {
+      const displayName =
+        signedInUser?.name || fullName.trim() || email.split('@')[0] || 'Author';
+
+      if (supabase) {
+        let activeUserId = signedInUser?.id;
+
+        if (authModalMode === 'login') {
+          const {data, error} = await supabase.auth.signInWithPassword({
+            email: email.trim(),
+            password,
+          });
+          if (error) {
+            setFormError(error.message);
+            setSubmitting(false);
+            return;
+          }
+          const user = data.user;
+          const resolvedName =
+            (user.user_metadata?.full_name as string | undefined) ||
+            user.email?.split('@')[0] ||
+            'Member';
+          setSignedInUser({
+            id: user.id,
+            name: resolvedName,
+            role:
+              (user.user_metadata?.account_role as string | undefined) ||
+              'Reader account',
+          });
+          setFeedbackBanner(`Signed in as ${resolvedName}.`);
+          setAuthModalMode(null);
+          setPassword('');
+          setSubmitting(false);
+          return;
+        }
+
+        if (authModalMode === 'signup') {
+          const {data, error} = await supabase.auth.signUp({
+            email: email.trim(),
+            password,
+            options: {
+              data: {
+                full_name: displayName,
+                account_role: accountType,
+              },
+            },
+          });
+          if (error) {
+            setFormError(error.message);
+            setSubmitting(false);
+            return;
+          }
+          if (data.session && data.user) {
+            setSignedInUser({
+              id: data.user.id,
+              name: displayName,
+              role: accountType,
+            });
+            setFeedbackBanner(
+              `Welcome to World Book Records, ${displayName} (${accountType}).`,
+            );
+          } else {
+            setFeedbackBanner(
+              'Account created. Check your email to confirm before signing in.',
+            );
+          }
+          setAuthModalMode(null);
+          setPassword('');
+          setSubmitting(false);
+          return;
+        }
+
+        if (authModalMode === 'publish') {
+          if (!activeUserId) {
+            const signInAttempt = await supabase.auth.signInWithPassword({
+              email: email.trim(),
+              password,
+            });
+            if (!signInAttempt.error && signInAttempt.data.user) {
+              activeUserId = signInAttempt.data.user.id;
+            } else {
+              const signUpAttempt = await supabase.auth.signUp({
+                email: email.trim(),
+                password,
+                options: {
+                  data: {
+                    full_name: displayName,
+                    account_role: 'Author account',
+                  },
+                },
+              });
+              if (signUpAttempt.error) {
+                setFormError(signUpAttempt.error.message);
+                setSubmitting(false);
+                return;
+              }
+              activeUserId = signUpAttempt.data.user?.id;
+              if (!signUpAttempt.data.session) {
+                setFormError(
+                  'Please confirm your email address, then sign in to publish your book.',
+                );
+                setSubmitting(false);
+                return;
+              }
+            }
+          }
+
+          const words = bookTitleInput.trim().split(/\s+/);
+          const splitIdx = Math.ceil(words.length / 2);
+          const line1 = words.slice(0, splitIdx).join(' ');
+          const line2 = words.slice(splitIdx).join(' ') || 'Edition';
+          const variants: BookCoverVariant[] = ['c1', 'c2', 'c3', 'c4'];
+          const variant = variants[books.length % variants.length];
+          const priceLabel =
+            bookAccessInput === 'Free' ? 'Free' : bookPriceInput.trim() || '$4.99';
+          const newId = `book-${Date.now()}`;
+
+          const {data: insertedBook, error: insertError} = await supabase
+            .from('books')
+            .insert({
+              id: newId,
+              user_id: activeUserId,
+              title: bookTitleInput.trim(),
+              title_line_1: line1,
+              title_line_2: line2,
+              author_name: displayName,
+              category: bookCategoryInput,
+              access_type: bookAccessInput,
+              price_label: priceLabel,
+              cover_variant: variant,
+              cover_kicker: 'WORLD BOOK RECORDS',
+              cover_footer: `BY ${displayName.toUpperCase()}`,
+              pages: 210,
+              published_year: 2026,
+              synopsis: `Published to the World Book Records library by ${displayName}.`,
+              excerpt:
+                'Every story begins with a single page shared openly with readers across borders.',
+            })
+            .select()
+            .single();
+
+          if (insertError) {
+            setFormError(insertError.message);
+            setSubmitting(false);
+            return;
+          }
+
+          if (insertedBook) {
+            setBooks((prev) => [mapDbBook(insertedBook as DbBookRow), ...prev]);
+          }
+          setFeedbackBanner(
+            `"${bookTitleInput.trim()}" has been published to World Book Records.`,
+          );
+          setBookTitleInput('');
+          setAuthModalMode(null);
+          setPassword('');
+          setSubmitting(false);
+          return;
+        }
+      }
+
+      // Fallback when Supabase environment variables are not yet configured
+      if (authModalMode === 'publish' && bookTitleInput.trim()) {
+        const words = bookTitleInput.trim().split(/\s+/);
+        const splitIdx = Math.ceil(words.length / 2);
+        const line1 = words.slice(0, splitIdx).join(' ');
+        const line2 = words.slice(splitIdx).join(' ') || 'Edition';
+        const variants: BookCoverVariant[] = ['c1', 'c2', 'c3', 'c4'];
+        const variant = variants[books.length % variants.length];
+        const priceLabel =
+          bookAccessInput === 'Free' ? 'Free' : bookPriceInput.trim() || '$4.99';
+
+        const newBook: BookItem = {
+          id: `book-${Date.now()}`,
+          titleLines: [line1, line2],
+          title: bookTitleInput.trim(),
+          author: displayName,
+          category: bookCategoryInput,
+          type: bookAccessInput,
+          priceLabel,
+          coverVariant: variant,
+          coverKicker: 'WORLD BOOK RECORDS',
+          coverFooter: `BY ${displayName.toUpperCase()}`,
+          pages: 210,
+          publishedYear: 2026,
+          synopsis: `Published to the World Book Records library by ${displayName}.`,
+          excerpt:
+            'Every story begins with a single page shared openly with readers across borders.',
+        };
+
+        setBooks((prev) => [newBook, ...prev]);
+        setSignedInUser({name: displayName, role: 'Author account'});
+        setFeedbackBanner(
+          `"${newBook.title}" has been added to the World Book Records library.`,
+        );
+        setBookTitleInput('');
+      } else if (authModalMode === 'login') {
+        setSignedInUser({name: displayName, role: accountType});
+        setFeedbackBanner(`Signed in as ${displayName}.`);
+      } else {
+        setSignedInUser({name: displayName, role: accountType});
+        setFeedbackBanner(
+          `Welcome to World Book Records, ${displayName} (${accountType}).`,
+        );
+      }
+
+      setAuthModalMode(null);
+      setPassword('');
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   const filterByAuthor = (author: AuthorItem) => {
@@ -249,6 +589,13 @@ export default function WorldBookRecords() {
                 </span>
                 <button
                   type="button"
+                  onClick={handleSignOut}
+                  className="hidden min-[541px]:inline-flex border border-[#302c25] rounded-[9px] px-3 py-2 text-[#d2cec5] bg-transparent hover:border-[#d8b35d] hover:text-[#d8b35d] text-[13px] cursor-pointer transition-colors whitespace-nowrap"
+                >
+                  Sign out
+                </button>
+                <button
+                  type="button"
                   onClick={() => openAuthModal('publish')}
                   className="border border-[#d8b35d] rounded-[9px] px-4 py-2.5 text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] font-bold text-[14px] cursor-pointer transition-colors whitespace-nowrap"
                 >
@@ -324,7 +671,18 @@ export default function WorldBookRecords() {
                 >
                   Publish
                 </a>
-                {!signedInUser && (
+                {signedInUser ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMobileMenuOpen(false);
+                      handleSignOut();
+                    }}
+                    className="mt-1 border border-[#302c25] rounded-[9px] px-4 py-2 text-[#d2cec5] text-left font-bold cursor-pointer"
+                  >
+                    Sign out ({signedInUser.name})
+                  </button>
+                ) : (
                   <button
                     type="button"
                     onClick={() => openAuthModal('login')}
@@ -645,7 +1003,7 @@ export default function WorldBookRecords() {
             </div>
 
             <div className="grid grid-cols-1 min-[541px]:grid-cols-2 min-[851px]:grid-cols-3 gap-4">
-              {AUTHORS.slice(0, 3).map((author) => (
+              {authors.slice(0, 3).map((author) => (
                 <div
                   key={author.id}
                   onClick={() => filterByAuthor(author)}
@@ -709,7 +1067,7 @@ export default function WorldBookRecords() {
             </div>
 
             <div className="grid grid-cols-1 min-[541px]:grid-cols-2 min-[851px]:grid-cols-3 gap-4">
-              {LITERARY_RECORDS.map((record) => (
+              {records.map((record) => (
                 <div
                   key={record.number}
                   className="border border-[#514022] rounded-[13px] p-[22px]"
@@ -831,8 +1189,14 @@ export default function WorldBookRecords() {
                 {modalMeta[authModalMode].desc}
               </p>
 
+              {formError && (
+                <div className="mb-3 rounded-[8px] border border-red-500/40 bg-red-950/40 px-3 py-2 text-[12px] text-red-200">
+                  {formError}
+                </div>
+              )}
+
               <form onSubmit={handleFormSubmit} className="space-y-2.5">
-                {authModalMode !== 'login' && (
+                {authModalMode !== 'login' && !signedInUser && (
                   <input
                     type="text"
                     required
@@ -842,22 +1206,29 @@ export default function WorldBookRecords() {
                     className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-white outline-none"
                   />
                 )}
-                <input
-                  type="email"
-                  required
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  placeholder="Email address"
-                  className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-white outline-none"
-                />
-                <input
-                  type="password"
-                  required
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder={authModalMode === 'login' ? 'Password' : 'Create password'}
-                  className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-white outline-none"
-                />
+                {!signedInUser && (
+                  <>
+                    <input
+                      type="email"
+                      required
+                      value={email}
+                      onChange={(e) => setEmail(e.target.value)}
+                      placeholder="Email address"
+                      className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-white outline-none"
+                    />
+                    <input
+                      type="password"
+                      required
+                      minLength={6}
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      placeholder={
+                        authModalMode === 'login' ? 'Password' : 'Create password'
+                      }
+                      className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-white outline-none"
+                    />
+                  </>
+                )}
 
                 {authModalMode === 'publish' ? (
                   <>
@@ -905,33 +1276,36 @@ export default function WorldBookRecords() {
                     )}
                   </>
                 ) : (
-                  <select
-                    value={accountType}
-                    onChange={(e) =>
-                      setAccountType(
-                        e.target.value as 'Reader account' | 'Author account',
-                      )
-                    }
-                    aria-label="Account role"
-                    className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-white outline-none"
-                  >
-                    <option value="Reader account">Reader account</option>
-                    <option value="Author account">Author account</option>
-                  </select>
+                  authModalMode === 'signup' && (
+                    <select
+                      value={accountType}
+                      onChange={(e) =>
+                        setAccountType(
+                          e.target.value as 'Reader account' | 'Author account',
+                        )
+                      }
+                      aria-label="Account role"
+                      className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-white outline-none"
+                    >
+                      <option value="Reader account">Reader account</option>
+                      <option value="Author account">Author account</option>
+                    </select>
+                  )
                 )}
 
                 <button
                   type="submit"
-                  className="w-full mt-2 border border-[#d8b35d] rounded-[9px] px-4 py-2.5 text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] font-bold cursor-pointer transition-colors"
+                  disabled={submitting}
+                  className="w-full mt-2 border border-[#d8b35d] rounded-[9px] px-4 py-2.5 text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] disabled:opacity-60 font-bold cursor-pointer transition-colors"
                 >
-                  Continue
+                  {submitting ? 'Please wait…' : 'Continue'}
                 </button>
               </form>
 
               <p className="text-[11px] text-[#a99b7b] mt-3 mb-0">
                 {authModalMode === 'publish'
-                  ? 'Your newly published title will appear immediately in the library grid for this session.'
-                  : 'Session state is stored locally in your browser during this visit.'}
+                  ? 'Your newly published title will appear in the library grid.'
+                  : 'Create an account or sign in to publish books and manage your library.'}
               </p>
             </motion.div>
           </motion.div>
@@ -1086,7 +1460,7 @@ export default function WorldBookRecords() {
               </h2>
 
               <div className="space-y-3">
-                {AUTHORS.map((author) => (
+                {authors.map((author) => (
                   <div
                     key={author.id}
                     className="flex items-start gap-3.5 bg-[#141417] border border-[#292621] rounded-[12px] p-4"
