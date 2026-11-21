@@ -4,6 +4,7 @@ export type BookCoverVariant = 'c1' | 'c2' | 'c3' | 'c4';
 
 export interface BookItem {
   id: string;
+  userId?: string;
   titleLines: [string, string];
   title: string;
   author: string;

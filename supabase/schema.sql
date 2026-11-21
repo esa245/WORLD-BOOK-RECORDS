@@ -9,8 +9,11 @@ create table if not exists public.profiles (
   full_name text not null,
   account_role text not null default 'Reader account'
     check (account_role in ('Reader account', 'Author account')),
+  avatar_url text,
   created_at timestamptz not null default now()
 );
+
+alter table public.profiles add column if not exists avatar_url text;
 
 alter table public.profiles enable row level security;
 
@@ -18,6 +21,11 @@ drop policy if exists "Users can view own profile" on public.profiles;
 create policy "Users can view own profile"
   on public.profiles for select
   using (auth.uid() = id);
+
+drop policy if exists "Users can insert own profile" on public.profiles;
+create policy "Users can insert own profile"
+  on public.profiles for insert
+  with check (auth.uid() = id);
 
 drop policy if exists "Users can update own profile" on public.profiles;
 create policy "Users can update own profile"

@@ -1,15 +1,18 @@
 'use client';
 
-import React, {useEffect, useMemo, useState} from 'react';
+import React, {useEffect, useMemo, useRef, useState} from 'react';
 import {AnimatePresence, motion} from 'motion/react';
 import {
   ArrowRight,
   ArrowUpRight,
   BookOpen,
+  Camera,
   Check,
   Menu,
+  Plus,
   Search,
   Sparkles,
+  User,
   X,
 } from 'lucide-react';
 import {
@@ -25,10 +28,35 @@ import {
   LITERARY_RECORDS,
   MilestoneRecord,
 } from '@/data/library';
-import {supabase} from '@/lib/supabase';
+import {
+  createBrowserSupabaseClient,
+  PublicSupabaseConfig,
+} from '@/lib/supabase';
 
 type FilterOption = 'All' | BookCategory | BookAccessType;
 type AuthModalMode = 'login' | 'signup' | 'publish';
+
+interface SignedInUser {
+  id: string;
+  name: string;
+  email?: string;
+  role: string;
+  avatarUrl?: string;
+}
+
+interface LocalAccountRecord {
+  id: string;
+  name: string;
+  email: string;
+  password: string;
+  role: string;
+  avatarUrl?: string;
+}
+
+const LOCAL_USERS_KEY = 'wbr_local_users_v1';
+const LOCAL_SESSION_KEY = 'wbr_local_session_v1';
+const LOCAL_BOOKS_KEY = 'wbr_local_books_v1';
+const AVATAR_CACHE_PREFIX = 'wbr_avatar_v1_';
 
 const FILTER_OPTIONS: {value: FilterOption; label: string}[] = [
   {value: 'All', label: 'All books'},
@@ -48,6 +76,7 @@ const COVER_GRADIENTS: Record<BookCoverVariant, string> = {
 
 interface DbBookRow {
   id: string;
+  user_id?: string | null;
   title: string;
   title_line_1: string;
   title_line_2: string;
@@ -84,6 +113,7 @@ interface DbRecordRow {
 function mapDbBook(row: DbBookRow): BookItem {
   return {
     id: row.id,
+    userId: row.user_id || undefined,
     title: row.title,
     titleLines: [row.title_line_1, row.title_line_2],
     author: row.author_name,
@@ -113,31 +143,104 @@ function mapDbAuthor(row: DbAuthorRow): AuthorItem {
   };
 }
 
-export default function WorldBookRecords() {
-  const [books, setBooks] = useState<BookItem[]>(INITIAL_BOOKS);
-  const [authors, setAuthors] = useState<AuthorItem[]>(AUTHORS);
-  const [records, setRecords] = useState<MilestoneRecord[]>(LITERARY_RECORDS);
+function getInitials(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return 'W';
+  return parts
+    .slice(0, 2)
+    .map((p) => p[0]?.toUpperCase() || '')
+    .join('');
+}
+
+async function resizeImageToAvatar(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Failed to read image file.'));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error('Unsupported image format.'));
+      img.onload = () => {
+        const size = 180;
+        const canvas = document.createElement('canvas');
+        canvas.width = size;
+        canvas.height = size;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          resolve(String(reader.result || ''));
+          return;
+        }
+        const minSide = Math.min(img.width, img.height);
+        const sx = (img.width - minSide) / 2;
+        const sy = (img.height - minSide) / 2;
+        ctx.drawImage(img, sx, sy, minSide, minSide, 0, 0, size, size);
+        resolve(canvas.toDataURL('image/jpeg', 0.78));
+      };
+      img.src = String(reader.result || '');
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function readLocalJson<T>(key: string, fallback: T): T {
+  if (typeof window === 'undefined') return fallback;
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return fallback;
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeLocalJson(key: string, value: unknown) {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
+interface WorldBookRecordsProps {
+  initialBooks?: BookItem[];
+  initialAuthors?: AuthorItem[];
+  initialRecords?: MilestoneRecord[];
+  supabaseConfig?: PublicSupabaseConfig | null;
+}
+
+export default function WorldBookRecords({
+  initialBooks = INITIAL_BOOKS,
+  initialAuthors = AUTHORS,
+  initialRecords = LITERARY_RECORDS,
+  supabaseConfig = null,
+}: WorldBookRecordsProps) {
+  const supabaseClient = useMemo(
+    () => createBrowserSupabaseClient(supabaseConfig),
+    [supabaseConfig],
+  );
+
+  const [books, setBooks] = useState<BookItem[]>(initialBooks);
+  const [authors, setAuthors] = useState<AuthorItem[]>(initialAuthors);
+  const [records, setRecords] = useState<MilestoneRecord[]>(initialRecords);
   const [searchQuery, setSearchQuery] = useState('');
   const [activeFilter, setActiveFilter] = useState<FilterOption>('All');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
   // Modals
   const [authModalMode, setAuthModalMode] = useState<AuthModalMode | null>(null);
+  const [profileModalOpen, setProfileModalOpen] = useState(false);
   const [selectedBook, setSelectedBook] = useState<BookItem | null>(null);
   const [authorsDirectoryOpen, setAuthorsDirectoryOpen] = useState(false);
   const [selectedInfoPage, setSelectedInfoPage] = useState<InfoPageItem | null>(null);
 
   // Account & Publish form state
-  const [signedInUser, setSignedInUser] = useState<{
-    id?: string;
-    name: string;
-    role: string;
-  } | null>(null);
+  const [signedInUser, setSignedInUser] = useState<SignedInUser | null>(null);
   const [fullName, setFullName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [avatarDraft, setAvatarDraft] = useState<string>('');
   const [accountType, setAccountType] = useState<'Reader account' | 'Author account'>(
-    'Reader account',
+    'Author account',
   );
   const [bookTitleInput, setBookTitleInput] = useState('');
   const [bookCategoryInput, setBookCategoryInput] = useState<BookCategory>('Fiction');
@@ -146,11 +249,16 @@ export default function WorldBookRecords() {
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [feedbackBanner, setFeedbackBanner] = useState<string | null>(null);
+  const [avatarLoadError, setAvatarLoadError] = useState(false);
+
+  const signupFileInputRef = useRef<HTMLInputElement | null>(null);
+  const profileFileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         setAuthModalMode(null);
+        setProfileModalOpen(false);
         setSelectedBook(null);
         setAuthorsDirectoryOpen(false);
         setSelectedInfoPage(null);
@@ -167,25 +275,98 @@ export default function WorldBookRecords() {
     return () => clearTimeout(timer);
   }, [feedbackBanner]);
 
-  // Sync data and auth session with Supabase when configured
+  // Sync data & session (Supabase when active, or browser localStorage fallback)
   useEffect(() => {
-    const client = supabase;
-    if (!client) return;
-
     let isMounted = true;
+
+    const loadProfileDetails = async (
+      userId: string,
+      fallbackName: string,
+      fallbackEmail: string | undefined,
+      fallbackRole: string,
+    ): Promise<SignedInUser> => {
+      let cachedAvatar = '';
+      try {
+        cachedAvatar = window.localStorage.getItem(`${AVATAR_CACHE_PREFIX}${userId}`) || '';
+      } catch {
+        cachedAvatar = '';
+      }
+
+      if (supabaseClient) {
+        try {
+          const {data: profileRow} = await supabaseClient
+            .from('profiles')
+            .select('full_name, account_role, avatar_url')
+            .eq('id', userId)
+            .maybeSingle();
+
+          if (profileRow) {
+            const avatarUrl =
+              (profileRow.avatar_url as string | null) || cachedAvatar || undefined;
+            if (avatarUrl) {
+              try {
+                window.localStorage.setItem(`${AVATAR_CACHE_PREFIX}${userId}`, avatarUrl);
+              } catch {
+                // Ignore
+              }
+            }
+            return {
+              id: userId,
+              name: (profileRow.full_name as string | null) || fallbackName,
+              email: fallbackEmail,
+              role: (profileRow.account_role as string | null) || fallbackRole,
+              avatarUrl,
+            };
+          }
+        } catch {
+          // Use auth metadata + cached avatar fallback
+        }
+      }
+
+      return {
+        id: userId,
+        name: fallbackName,
+        email: fallbackEmail,
+        role: fallbackRole,
+        avatarUrl: cachedAvatar || undefined,
+      };
+    };
+
+    if (!supabaseClient) {
+      const restoreLocal = async () => {
+        await Promise.resolve();
+        if (!isMounted) return;
+        const savedSession = readLocalJson<SignedInUser | null>(LOCAL_SESSION_KEY, null);
+        if (savedSession) {
+          setSignedInUser(savedSession);
+        }
+        const localBooks = readLocalJson<BookItem[]>(LOCAL_BOOKS_KEY, []);
+        if (localBooks.length > 0) {
+          setBooks((prev) => {
+            const existingIds = new Set(prev.map((b) => b.id));
+            const uniqueLocal = localBooks.filter((b) => !existingIds.has(b.id));
+            return [...uniqueLocal, ...prev];
+          });
+        }
+      };
+      restoreLocal();
+      return () => {
+        isMounted = false;
+      };
+    }
 
     const loadCatalog = async () => {
       try {
         const [booksRes, authorsRes, recordsRes] = await Promise.all([
-          client
+          supabaseClient
             .from('books')
             .select('*')
             .order('created_at', {ascending: false}),
-          client
+          supabaseClient
             .from('authors')
             .select('*')
             .order('published_count', {ascending: false}),
-          client
+          supabaseClient
             .from('literary_records')
             .select('*')
             .order('sort_order', {ascending: true}),
@@ -193,10 +374,10 @@ export default function WorldBookRecords() {
 
         if (!isMounted) return;
 
-        if (!booksRes.error && booksRes.data && booksRes.data.length > 0) {
+        if (!booksRes.error && booksRes.data) {
           setBooks((booksRes.data as DbBookRow[]).map(mapDbBook));
         }
-        if (!authorsRes.error && authorsRes.data && authorsRes.data.length > 0) {
+        if (!authorsRes.error && authorsRes.data) {
           setAuthors((authorsRes.data as DbAuthorRow[]).map(mapDbAuthor));
         }
         if (!recordsRes.error && recordsRes.data && recordsRes.data.length > 0) {
@@ -209,55 +390,72 @@ export default function WorldBookRecords() {
           );
         }
       } catch {
-        // Keep initial curated catalog if tables are not yet initialized
+        // Keep server-provided catalog
       }
     };
 
     const syncSession = async () => {
-      const {data} = await client.auth.getSession();
+      const {data} = await supabaseClient.auth.getSession();
       if (!isMounted) return;
       const user = data.session?.user;
       if (user) {
-        setSignedInUser({
-          id: user.id,
-          name:
-            (user.user_metadata?.full_name as string | undefined) ||
+        const resolved = await loadProfileDetails(
+          user.id,
+          (user.user_metadata?.full_name as string | undefined) ||
             user.email?.split('@')[0] ||
             'Member',
-          role:
-            (user.user_metadata?.account_role as string | undefined) ||
-            'Reader account',
-        });
+          user.email,
+          (user.user_metadata?.account_role as string | undefined) || 'Reader account',
+        );
+        if (isMounted) {
+          setAvatarLoadError(false);
+          setSignedInUser(resolved);
+        }
       }
     };
 
     loadCatalog();
     syncSession();
 
-    const {data: authSub} = client.auth.onAuthStateChange((_event, session) => {
-      if (!isMounted) return;
-      const user = session?.user;
-      if (user) {
-        setSignedInUser({
-          id: user.id,
-          name:
+    const {data: authSub} = supabaseClient.auth.onAuthStateChange(
+      async (_event, session) => {
+        if (!isMounted) return;
+        const user = session?.user;
+        if (user) {
+          const resolved = await loadProfileDetails(
+            user.id,
             (user.user_metadata?.full_name as string | undefined) ||
-            user.email?.split('@')[0] ||
-            'Member',
-          role:
+              user.email?.split('@')[0] ||
+              'Member',
+            user.email,
             (user.user_metadata?.account_role as string | undefined) ||
-            'Reader account',
-        });
-      } else {
-        setSignedInUser(null);
-      }
-    });
+              'Reader account',
+          );
+          if (isMounted) {
+            setAvatarLoadError(false);
+            setSignedInUser(resolved);
+          }
+        } else {
+          setSignedInUser(null);
+        }
+      },
+    );
 
     return () => {
       isMounted = false;
       authSub.subscription.unsubscribe();
     };
-  }, []);
+  }, [supabaseClient]);
+
+  const myPublishedBooks = useMemo(() => {
+    if (!signedInUser) return [];
+    const userNameLower = signedInUser.name.trim().toLowerCase();
+    return books.filter(
+      (book) =>
+        (book.userId && book.userId === signedInUser.id) ||
+        book.author.trim().toLowerCase() === userNameLower,
+    );
+  }, [books, signedInUser]);
 
   const filteredBooks = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -282,10 +480,73 @@ export default function WorldBookRecords() {
     }
   };
 
-  const handleSignOut = async () => {
-    if (supabase) {
-      await supabase.auth.signOut();
+  const scrollToProfile = () => {
+    setProfileModalOpen(true);
+  };
+
+  const handleSignupAvatarPick = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const compressed = await resizeImageToAvatar(file);
+      setAvatarDraft(compressed);
+      setFormError(null);
+    } catch {
+      setFormError('Could not process that image. Please choose a JPG or PNG photo.');
     }
+  };
+
+  const handleProfileAvatarUpdate = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !signedInUser) return;
+    try {
+      const compressed = await resizeImageToAvatar(file);
+      setAvatarLoadError(false);
+      const updatedUser: SignedInUser = {...signedInUser, avatarUrl: compressed};
+      setSignedInUser(updatedUser);
+
+      try {
+        window.localStorage.setItem(`${AVATAR_CACHE_PREFIX}${signedInUser.id}`, compressed);
+      } catch {
+        // Ignore
+      }
+
+      if (supabaseClient) {
+        await supabaseClient
+          .from('profiles')
+          .upsert({
+            id: signedInUser.id,
+            full_name: signedInUser.name,
+            account_role:
+              signedInUser.role === 'Author account'
+                ? 'Author account'
+                : 'Reader account',
+            avatar_url: compressed,
+          });
+      } else {
+        writeLocalJson(LOCAL_SESSION_KEY, updatedUser);
+        const localUsers = readLocalJson<LocalAccountRecord[]>(LOCAL_USERS_KEY, []);
+        writeLocalJson(
+          LOCAL_USERS_KEY,
+          localUsers.map((u) =>
+            u.id === signedInUser.id ? {...u, avatarUrl: compressed} : u,
+          ),
+        );
+      }
+
+      setFeedbackBanner('Profile photo updated.');
+    } catch {
+      setFeedbackBanner('Could not update profile photo.');
+    }
+  };
+
+  const handleSignOut = async () => {
+    if (supabaseClient) {
+      await supabaseClient.auth.signOut();
+    } else {
+      window.localStorage.removeItem(LOCAL_SESSION_KEY);
+    }
+    setProfileModalOpen(false);
     setSignedInUser(null);
     setFeedbackBanner('Signed out of your account.');
   };
@@ -296,15 +557,17 @@ export default function WorldBookRecords() {
     setSubmitting(true);
 
     try {
+      const trimmedEmail = email.trim().toLowerCase();
       const displayName =
-        signedInUser?.name || fullName.trim() || email.split('@')[0] || 'Author';
+        signedInUser?.name || fullName.trim() || trimmedEmail.split('@')[0] || 'Author';
 
-      if (supabase) {
+      // 1. SUPABASE AUTH + DATABASE MODE
+      if (supabaseClient) {
         let activeUserId = signedInUser?.id;
 
         if (authModalMode === 'login') {
-          const {data, error} = await supabase.auth.signInWithPassword({
-            email: email.trim(),
+          const {data, error} = await supabaseClient.auth.signInWithPassword({
+            email: trimmedEmail,
             password,
           });
           if (error) {
@@ -312,28 +575,59 @@ export default function WorldBookRecords() {
             setSubmitting(false);
             return;
           }
+
           const user = data.user;
           const resolvedName =
             (user.user_metadata?.full_name as string | undefined) ||
             user.email?.split('@')[0] ||
             'Member';
+          const resolvedRole =
+            (user.user_metadata?.account_role as string | undefined) ||
+            'Reader account';
+
+          let avatarUrl: string | undefined;
+          try {
+            const {data: prof} = await supabaseClient
+              .from('profiles')
+              .select('full_name, account_role, avatar_url')
+              .eq('id', user.id)
+              .maybeSingle();
+            if (prof?.avatar_url) {
+              avatarUrl = prof.avatar_url as string;
+            }
+          } catch {
+            // Ignore if profiles table doesn't have avatar_url yet
+          }
+
+          if (!avatarUrl) {
+            try {
+              avatarUrl =
+                window.localStorage.getItem(`${AVATAR_CACHE_PREFIX}${user.id}`) ||
+                undefined;
+            } catch {
+              avatarUrl = undefined;
+            }
+          }
+
+          setAvatarLoadError(false);
           setSignedInUser({
             id: user.id,
             name: resolvedName,
-            role:
-              (user.user_metadata?.account_role as string | undefined) ||
-              'Reader account',
+            email: user.email,
+            role: resolvedRole,
+            avatarUrl,
           });
-          setFeedbackBanner(`Signed in as ${resolvedName}.`);
+          setFeedbackBanner(`Welcome back, ${resolvedName}.`);
           setAuthModalMode(null);
           setPassword('');
+          scrollToProfile();
           setSubmitting(false);
           return;
         }
 
         if (authModalMode === 'signup') {
-          const {data, error} = await supabase.auth.signUp({
-            email: email.trim(),
+          const {data, error} = await supabaseClient.auth.signUp({
+            email: trimmedEmail,
             password,
             options: {
               data: {
@@ -347,37 +641,65 @@ export default function WorldBookRecords() {
             setSubmitting(false);
             return;
           }
-          if (data.session && data.user) {
-            setSignedInUser({
-              id: data.user.id,
-              name: displayName,
-              role: accountType,
-            });
-            setFeedbackBanner(
-              `Welcome to World Book Records, ${displayName} (${accountType}).`,
-            );
-          } else {
-            setFeedbackBanner(
-              'Account created. Check your email to confirm before signing in.',
-            );
+
+          if (data.user) {
+            if (avatarDraft) {
+              try {
+                window.localStorage.setItem(
+                  `${AVATAR_CACHE_PREFIX}${data.user.id}`,
+                  avatarDraft,
+                );
+              } catch {
+                // Ignore
+              }
+            }
+
+            if (data.session) {
+              await supabaseClient.from('profiles').upsert({
+                id: data.user.id,
+                full_name: displayName,
+                account_role: accountType,
+                avatar_url: avatarDraft || null,
+              });
+
+              setAvatarLoadError(false);
+              setSignedInUser({
+                id: data.user.id,
+                name: displayName,
+                email: data.user.email,
+                role: accountType,
+                avatarUrl: avatarDraft || undefined,
+              });
+              setFeedbackBanner(`Welcome to World Book Records, ${displayName}.`);
+              setAuthModalMode(null);
+              setPassword('');
+              setAvatarDraft('');
+              scrollToProfile();
+            } else {
+              setFeedbackBanner(
+                'Account created. Check your email to confirm before signing in.',
+              );
+              setAuthModalMode(null);
+              setPassword('');
+              setAvatarDraft('');
+            }
           }
-          setAuthModalMode(null);
-          setPassword('');
+
           setSubmitting(false);
           return;
         }
 
         if (authModalMode === 'publish') {
           if (!activeUserId) {
-            const signInAttempt = await supabase.auth.signInWithPassword({
-              email: email.trim(),
+            const signInAttempt = await supabaseClient.auth.signInWithPassword({
+              email: trimmedEmail,
               password,
             });
             if (!signInAttempt.error && signInAttempt.data.user) {
               activeUserId = signInAttempt.data.user.id;
             } else {
-              const signUpAttempt = await supabase.auth.signUp({
-                email: email.trim(),
+              const signUpAttempt = await supabaseClient.auth.signUp({
+                email: trimmedEmail,
                 password,
                 options: {
                   data: {
@@ -412,7 +734,7 @@ export default function WorldBookRecords() {
             bookAccessInput === 'Free' ? 'Free' : bookPriceInput.trim() || '$4.99';
           const newId = `book-${Date.now()}`;
 
-          const {data: insertedBook, error: insertError} = await supabase
+          const {data: insertedBook, error: insertError} = await supabaseClient
             .from('books')
             .insert({
               id: newId,
@@ -445,19 +767,150 @@ export default function WorldBookRecords() {
           if (insertedBook) {
             setBooks((prev) => [mapDbBook(insertedBook as DbBookRow), ...prev]);
           }
+
+          if (
+            activeUserId &&
+            !authors.some((a) => a.name.toLowerCase() === displayName.toLowerCase())
+          ) {
+            const initials = getInitials(displayName);
+            const {data: insertedAuthor} = await supabaseClient
+              .from('authors')
+              .insert({
+                id: `author-${activeUserId}`,
+                user_id: activeUserId,
+                initials,
+                name: displayName,
+                verified: false,
+                country: 'Global',
+                genre: bookCategoryInput,
+                published_count: 1,
+                bio: `Author of "${bookTitleInput.trim()}" on World Book Records.`,
+              })
+              .select()
+              .single();
+            if (insertedAuthor) {
+              setAuthors((prev) => [mapDbAuthor(insertedAuthor as DbAuthorRow), ...prev]);
+            }
+          }
+
           setFeedbackBanner(
             `"${bookTitleInput.trim()}" has been published to World Book Records.`,
           );
           setBookTitleInput('');
           setAuthModalMode(null);
           setPassword('');
+          scrollToProfile();
           setSubmitting(false);
           return;
         }
       }
 
-      // Fallback when Supabase environment variables are not yet configured
+      // 2. BROWSER PERSISTENCE MODE (when Supabase Secrets are not yet configured)
+      const localUsers = readLocalJson<LocalAccountRecord[]>(LOCAL_USERS_KEY, []);
+
+      if (authModalMode === 'login') {
+        const matched = localUsers.find((u) => u.email === trimmedEmail);
+        if (!matched) {
+          setFormError('No account found with that email. Switch to Sign up to join.');
+          setSubmitting(false);
+          return;
+        }
+        if (matched.password !== password) {
+          setFormError('Incorrect password. Please try again.');
+          setSubmitting(false);
+          return;
+        }
+        const sessionUser: SignedInUser = {
+          id: matched.id,
+          name: matched.name,
+          email: matched.email,
+          role: matched.role,
+          avatarUrl: matched.avatarUrl,
+        };
+        writeLocalJson(LOCAL_SESSION_KEY, sessionUser);
+        setAvatarLoadError(false);
+        setSignedInUser(sessionUser);
+        setFeedbackBanner(`Welcome back, ${matched.name}.`);
+        setAuthModalMode(null);
+        setPassword('');
+        scrollToProfile();
+        setSubmitting(false);
+        return;
+      }
+
+      if (authModalMode === 'signup') {
+        if (localUsers.some((u) => u.email === trimmedEmail)) {
+          setFormError('An account with this email already exists. Please log in.');
+          setSubmitting(false);
+          return;
+        }
+        const newAccount: LocalAccountRecord = {
+          id: `user-${Date.now()}`,
+          name: displayName,
+          email: trimmedEmail,
+          password,
+          role: accountType,
+          avatarUrl: avatarDraft || undefined,
+        };
+        writeLocalJson(LOCAL_USERS_KEY, [...localUsers, newAccount]);
+        const sessionUser: SignedInUser = {
+          id: newAccount.id,
+          name: newAccount.name,
+          email: newAccount.email,
+          role: newAccount.role,
+          avatarUrl: newAccount.avatarUrl,
+        };
+        writeLocalJson(LOCAL_SESSION_KEY, sessionUser);
+        setAvatarLoadError(false);
+        setSignedInUser(sessionUser);
+        setFeedbackBanner(`Welcome to World Book Records, ${displayName}.`);
+        setAuthModalMode(null);
+        setPassword('');
+        setAvatarDraft('');
+        scrollToProfile();
+        setSubmitting(false);
+        return;
+      }
+
       if (authModalMode === 'publish' && bookTitleInput.trim()) {
+        let currentSession = signedInUser;
+        if (!currentSession) {
+          const existing = localUsers.find((u) => u.email === trimmedEmail);
+          if (existing) {
+            if (existing.password !== password) {
+              setFormError('Incorrect password for this email.');
+              setSubmitting(false);
+              return;
+            }
+            currentSession = {
+              id: existing.id,
+              name: existing.name,
+              email: existing.email,
+              role: existing.role,
+              avatarUrl: existing.avatarUrl,
+            };
+          } else {
+            const newAccount: LocalAccountRecord = {
+              id: `user-${Date.now()}`,
+              name: displayName,
+              email: trimmedEmail,
+              password,
+              role: 'Author account',
+              avatarUrl: avatarDraft || undefined,
+            };
+            writeLocalJson(LOCAL_USERS_KEY, [...localUsers, newAccount]);
+            currentSession = {
+              id: newAccount.id,
+              name: newAccount.name,
+              email: newAccount.email,
+              role: newAccount.role,
+              avatarUrl: newAccount.avatarUrl,
+            };
+          }
+          writeLocalJson(LOCAL_SESSION_KEY, currentSession);
+          setSignedInUser(currentSession);
+        }
+
         const words = bookTitleInput.trim().split(/\s+/);
         const splitIdx = Math.ceil(words.length / 2);
         const line1 = words.slice(0, splitIdx).join(' ');
@@ -469,40 +922,34 @@ export default function WorldBookRecords() {
 
         const newBook: BookItem = {
           id: `book-${Date.now()}`,
+          userId: currentSession.id,
           titleLines: [line1, line2],
           title: bookTitleInput.trim(),
-          author: displayName,
+          author: currentSession.name,
           category: bookCategoryInput,
           type: bookAccessInput,
           priceLabel,
           coverVariant: variant,
           coverKicker: 'WORLD BOOK RECORDS',
-          coverFooter: `BY ${displayName.toUpperCase()}`,
+          coverFooter: `BY ${currentSession.name.toUpperCase()}`,
           pages: 210,
           publishedYear: 2026,
-          synopsis: `Published to the World Book Records library by ${displayName}.`,
+          synopsis: `Published to the World Book Records library by ${currentSession.name}.`,
           excerpt:
             'Every story begins with a single page shared openly with readers across borders.',
         };
 
+        const existingLocalBooks = readLocalJson<BookItem[]>(LOCAL_BOOKS_KEY, []);
+        writeLocalJson(LOCAL_BOOKS_KEY, [newBook, ...existingLocalBooks]);
         setBooks((prev) => [newBook, ...prev]);
-        setSignedInUser({name: displayName, role: 'Author account'});
         setFeedbackBanner(
-          `"${newBook.title}" has been added to the World Book Records library.`,
+          `"${newBook.title}" has been published to your profile and library.`,
         );
         setBookTitleInput('');
-      } else if (authModalMode === 'login') {
-        setSignedInUser({name: displayName, role: accountType});
-        setFeedbackBanner(`Signed in as ${displayName}.`);
-      } else {
-        setSignedInUser({name: displayName, role: accountType});
-        setFeedbackBanner(
-          `Welcome to World Book Records, ${displayName} (${accountType}).`,
-        );
+        setAuthModalMode(null);
+        setPassword('');
+        scrollToProfile();
       }
-
-      setAuthModalMode(null);
-      setPassword('');
     } finally {
       setSubmitting(false);
     }
@@ -519,7 +966,7 @@ export default function WorldBookRecords() {
   const modalMeta: Record<AuthModalMode, {title: string; desc: string}> = {
     login: {
       title: 'Welcome back',
-      desc: 'Sign in to continue to your library.',
+      desc: 'Sign in to view your profile and published books.',
     },
     signup: {
       title: 'Join World Book Records',
@@ -527,7 +974,7 @@ export default function WorldBookRecords() {
     },
     publish: {
       title: 'Start your author journey',
-      desc: 'Register as an author to publish your first book.',
+      desc: 'Publish a new book directly to your profile and the global library.',
     },
   };
 
@@ -584,22 +1031,34 @@ export default function WorldBookRecords() {
           <div className="flex items-center gap-[10px] shrink-0">
             {signedInUser ? (
               <div className="flex items-center gap-2.5">
-                <span className="hidden sm:inline text-[12px] text-[#d8b35d] font-semibold">
-                  {signedInUser.name}
-                </span>
+                <button
+                  type="button"
+                  onClick={() => setProfileModalOpen(true)}
+                  className="flex items-center gap-2 rounded-[9px] px-2 py-1 bg-transparent border-0 hover:bg-[#1b1a1c] transition-colors cursor-pointer"
+                >
+                  <span className="w-7 h-7 rounded-full border border-[#d8b35d] overflow-hidden grid place-items-center bg-[#242018] text-[#ffe6a8] font-serif text-[12px] shrink-0">
+                    {signedInUser.avatarUrl && !avatarLoadError ? (
+                      <img
+                        src={signedInUser.avatarUrl}
+                        alt={signedInUser.name}
+                        referrerPolicy="no-referrer"
+                        onError={() => setAvatarLoadError(true)}
+                        className="w-full h-full object-cover"
+                      />
+                    ) : (
+                      getInitials(signedInUser.name)
+                    )}
+                  </span>
+                  <span className="hidden sm:inline text-[12px] text-[#d8b35d] font-semibold max-w-[120px] truncate">
+                    {signedInUser.name}
+                  </span>
+                </button>
                 <button
                   type="button"
                   onClick={handleSignOut}
                   className="hidden min-[541px]:inline-flex border border-[#302c25] rounded-[9px] px-3 py-2 text-[#d2cec5] bg-transparent hover:border-[#d8b35d] hover:text-[#d8b35d] text-[13px] cursor-pointer transition-colors whitespace-nowrap"
                 >
                   Sign out
-                </button>
-                <button
-                  type="button"
-                  onClick={() => openAuthModal('publish')}
-                  className="border border-[#d8b35d] rounded-[9px] px-4 py-2.5 text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] font-bold text-[14px] cursor-pointer transition-colors whitespace-nowrap"
-                >
-                  Publish book
                 </button>
               </div>
             ) : (
@@ -643,6 +1102,18 @@ export default function WorldBookRecords() {
               className="min-[851px]:hidden border-t border-[#302c25] bg-[#0b0b0d] px-5 py-4"
             >
               <div className="flex flex-col gap-3 text-[14px] text-[#d2cec5]">
+                {signedInUser && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMobileMenuOpen(false);
+                      setProfileModalOpen(true);
+                    }}
+                    className="py-1.5 text-[#d8b35d] font-semibold text-left bg-transparent border-0 p-0 cursor-pointer"
+                  >
+                    My Profile ({signedInUser.name})
+                  </button>
+                )}
                 <a
                   href="#books"
                   onClick={() => setMobileMenuOpen(false)}
@@ -721,6 +1192,7 @@ export default function WorldBookRecords() {
       </AnimatePresence>
 
       <main>
+
         {/* Hero Section */}
         <section
           className="py-[52px] sm:py-[76px] pb-[35px] sm:pb-[58px] overflow-hidden"
@@ -754,7 +1226,9 @@ export default function WorldBookRecords() {
                 </a>
                 <button
                   type="button"
-                  onClick={() => openAuthModal('publish')}
+                  onClick={() =>
+                    signedInUser ? setProfileModalOpen(true) : openAuthModal('publish')
+                  }
                   className="border border-[#d8b35d] rounded-[9px] px-4 py-2.5 text-[#d8b35d] bg-transparent hover:bg-[#d8b35d]/10 font-bold text-[15px] cursor-pointer transition-colors whitespace-nowrap"
                 >
                   Publish your book
@@ -1111,7 +1585,9 @@ export default function WorldBookRecords() {
               </div>
               <button
                 type="button"
-                onClick={() => openAuthModal('publish')}
+                onClick={() =>
+                  signedInUser ? setProfileModalOpen(true) : openAuthModal('publish')
+                }
                 className="inline-flex items-center gap-1.5 border border-[#d8b35d] rounded-[9px] px-4 py-2.5 text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] font-bold cursor-pointer transition-colors whitespace-nowrap shrink-0"
               >
                 <span>Become an author</span>
@@ -1150,6 +1626,223 @@ export default function WorldBookRecords() {
         </div>
       </footer>
 
+      {/* Profile Modal: Photo on top -> Name below -> Published Books below */}
+      <AnimatePresence>
+        {profileModalOpen && signedInUser && (
+          <motion.div
+            initial={{opacity: 0}}
+            animate={{opacity: 1}}
+            exit={{opacity: 0}}
+            transition={{duration: 0.16}}
+            onClick={(e) => {
+              if (e.target === e.currentTarget) setProfileModalOpen(false);
+            }}
+            className="fixed inset-0 z-30 bg-black/80 grid place-items-center p-[18px]"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="profile-modal-title"
+          >
+            <motion.div
+              initial={{opacity: 0, scale: 0.97, y: 8}}
+              animate={{opacity: 1, scale: 1, y: 0}}
+              exit={{opacity: 0, scale: 0.97, y: 8}}
+              transition={{duration: 0.16}}
+              className="w-[min(860px,100%)] max-h-[90vh] overflow-y-auto bg-[#141417] border border-[#66512d] rounded-[18px] p-6 sm:p-8 relative"
+            >
+              <button
+                type="button"
+                onClick={() => setProfileModalOpen(false)}
+                aria-label="Close profile"
+                className="absolute right-[16px] top-[14px] bg-transparent border-0 text-[#aaa] hover:text-white cursor-pointer p-1"
+              >
+                <X className="w-5 h-5" />
+              </button>
+
+              {/* Top: Centered Photo */}
+              <div className="flex flex-col items-center text-center">
+                <div className="relative">
+                  <div
+                    className="w-24 h-24 sm:w-28 sm:h-28 rounded-full border-2 border-[#d8b35d] overflow-hidden grid place-items-center text-[#ffe6a8] font-serif text-[34px] shadow-[0_12px_30px_rgba(0,0,0,0.6)]"
+                    style={{
+                      background: 'linear-gradient(145deg, #76572b, #242018)',
+                    }}
+                  >
+                    {signedInUser.avatarUrl && !avatarLoadError ? (
+                      <img
+                        src={signedInUser.avatarUrl}
+                        alt={signedInUser.name}
+                        referrerPolicy="no-referrer"
+                        onError={() => setAvatarLoadError(true)}
+                        className="w-full h-full object-cover"
+                      />
+                    ) : (
+                      <span>{getInitials(signedInUser.name)}</span>
+                    )}
+                  </div>
+
+                  <input
+                    ref={profileFileInputRef}
+                    type="file"
+                    accept="image/*"
+                    onChange={handleProfileAvatarUpdate}
+                    className="hidden"
+                    aria-label="Update profile photo"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => profileFileInputRef.current?.click()}
+                    title="Change profile photo"
+                    aria-label="Change profile photo"
+                    className="absolute bottom-0 right-0 w-8 h-8 rounded-full bg-[#d8b35d] hover:bg-[#f2d58b] text-[#16130c] border-2 border-[#141417] grid place-items-center cursor-pointer transition-colors"
+                  >
+                    <Camera className="w-4 h-4" />
+                  </button>
+                </div>
+
+                {/* Middle: Name */}
+                <h2
+                  id="profile-modal-title"
+                  className="font-serif text-[28px] sm:text-[34px] mt-4 mb-1 font-normal text-[#f7f4ed]"
+                >
+                  {signedInUser.name}
+                </h2>
+                <p className="text-[13px] text-[#a7a3a0] m-0">
+                  {signedInUser.role}
+                  {signedInUser.email ? ` · ${signedInUser.email}` : ''}
+                  {' · '}
+                  <span className="text-[#d8b35d] tabular-nums">
+                    {myPublishedBooks.length}{' '}
+                    {myPublishedBooks.length === 1 ? 'published book' : 'published books'}
+                  </span>
+                </p>
+
+                <div className="flex items-center gap-3 mt-4 flex-wrap justify-center">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setProfileModalOpen(false);
+                      openAuthModal('publish');
+                    }}
+                    className="inline-flex items-center gap-1.5 border border-[#d8b35d] rounded-[9px] px-4 py-2 text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] font-bold text-[13px] cursor-pointer transition-colors"
+                  >
+                    <Plus className="w-4 h-4" />
+                    <span>Publish a new book</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => profileFileInputRef.current?.click()}
+                    className="border border-[#302c25] rounded-[9px] px-4 py-2 text-[#d2cec5] bg-[#0b0b0d] hover:border-[#d8b35d] hover:text-[#d8b35d] font-semibold text-[13px] cursor-pointer transition-colors"
+                  >
+                    Change photo
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleSignOut}
+                    className="border border-[#302c25] rounded-[9px] px-4 py-2 text-[#a7a3a0] bg-transparent hover:border-[#d8b35d] hover:text-[#d8b35d] font-semibold text-[13px] cursor-pointer transition-colors"
+                  >
+                    Sign out
+                  </button>
+                </div>
+              </div>
+
+              {/* Bottom: Published Books */}
+              <div className="mt-7 pt-6 border-t border-[#302c25]">
+                <div className="mb-4">
+                  <div className="text-[#d8b35d] text-[10px] font-extrabold tracking-[2.5px] uppercase">
+                    Author Shelf
+                  </div>
+                  <h3 className="font-serif text-[22px] m-0 mt-1 font-normal">
+                    Published books by {signedInUser.name}
+                  </h3>
+                </div>
+
+                {myPublishedBooks.length > 0 ? (
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 sm:gap-4">
+                    {myPublishedBooks.map((book) => (
+                      <article
+                        key={book.id}
+                        onClick={() => {
+                          setProfileModalOpen(false);
+                          setSelectedBook(book);
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault();
+                            setProfileModalOpen(false);
+                            setSelectedBook(book);
+                          }
+                        }}
+                        tabIndex={0}
+                        role="button"
+                        aria-label={`Read preview of ${book.title}`}
+                        className="bg-[#0d0d10] border border-[#292621] rounded-[13px] p-3 transition duration-200 hover:-translate-y-1 hover:border-[#806633] cursor-pointer focus-visible:outline-2 focus-visible:outline-[#d8b35d]"
+                      >
+                        <div
+                          className={`h-[155px] sm:h-[185px] rounded-[7px] p-3.5 flex flex-col justify-between shadow-[inset_5px_0_rgba(255,255,255,0.08)] relative overflow-hidden ${COVER_GRADIENTS[book.coverVariant]}`}
+                        >
+                          <span
+                            aria-hidden="true"
+                            className="absolute w-[140px] h-[140px] border border-white/15 rounded-full -right-[50px] -bottom-[45px] pointer-events-none"
+                          />
+                          <small className="text-[8px] tracking-[2px] opacity-80">
+                            {book.coverKicker}
+                          </small>
+                          <strong className="font-serif text-[19px] sm:text-[22px] leading-[1.08] max-w-[140px] font-normal">
+                            {book.titleLines[0]}
+                            <br />
+                            {book.titleLines[1]}
+                          </strong>
+                          <span className="text-[8px] tracking-[1.5px]">
+                            {book.coverFooter}
+                          </span>
+                        </div>
+
+                        <div className="pt-2.5 px-0.5 pb-0.5">
+                          <h4 className="font-serif text-[16px] m-0 mb-1 font-normal">
+                            {book.title}
+                          </h4>
+                          <div className="text-[12px] text-[#a7a3a0]">by {book.author}</div>
+                          <div className="flex justify-between items-center mt-2.5 text-[12px]">
+                            <span className="text-[#d7c18e] text-[11px]">
+                              {book.category}
+                            </span>
+                            <span className="text-[#d8b35d] font-extrabold tabular-nums">
+                              {book.priceLabel}
+                            </span>
+                          </div>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="bg-[#0d0d10] border border-[#292621] rounded-[13px] p-6 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+                    <div>
+                      <p className="font-serif text-[18px] text-[#f7f4ed] m-0">
+                        You haven&apos;t published a book yet.
+                      </p>
+                      <p className="text-[13px] text-[#a7a3a0] mt-1 mb-0">
+                        Publish your first book and it will appear right here under your
+                        profile.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setProfileModalOpen(false);
+                        openAuthModal('publish');
+                      }}
+                      className="border border-[#d8b35d] rounded-[9px] px-4 py-2.5 text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] font-bold text-[13px] cursor-pointer transition-colors whitespace-nowrap"
+                    >
+                      Publish your first book
+                    </button>
+                  </div>
+                )}
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Auth / Publish Modal */}
       <AnimatePresence>
         {authModalMode && (
@@ -1171,7 +1864,7 @@ export default function WorldBookRecords() {
               animate={{opacity: 1, scale: 1, y: 0}}
               exit={{opacity: 0, scale: 0.97, y: 8}}
               transition={{duration: 0.16}}
-              className="w-[min(480px,100%)] bg-[#171619] border border-[#66512d] rounded-[16px] p-[25px] relative"
+              className="w-[min(480px,100%)] max-h-[90vh] overflow-y-auto bg-[#171619] border border-[#66512d] rounded-[16px] p-[25px] relative"
             >
               <button
                 type="button"
@@ -1189,6 +1882,40 @@ export default function WorldBookRecords() {
                 {modalMeta[authModalMode].desc}
               </p>
 
+              {/* Login / Sign Up Switcher */}
+              {authModalMode !== 'publish' && (
+                <div className="grid grid-cols-2 gap-1.5 p-1 bg-[#0d0d0f] border border-[#302c25] rounded-[10px] mb-4">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setFormError(null);
+                      setAuthModalMode('signup');
+                    }}
+                    className={`py-2 text-[13px] font-bold rounded-[7px] cursor-pointer transition-colors ${
+                      authModalMode === 'signup'
+                        ? 'bg-[#d8b35d] text-[#16130c]'
+                        : 'text-[#a7a3a0] hover:text-white'
+                    }`}
+                  >
+                    Sign up
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setFormError(null);
+                      setAuthModalMode('login');
+                    }}
+                    className={`py-2 text-[13px] font-bold rounded-[7px] cursor-pointer transition-colors ${
+                      authModalMode === 'login'
+                        ? 'bg-[#d8b35d] text-[#16130c]'
+                        : 'text-[#a7a3a0] hover:text-white'
+                    }`}
+                  >
+                    Log in
+                  </button>
+                </div>
+              )}
+
               {formError && (
                 <div className="mb-3 rounded-[8px] border border-red-500/40 bg-red-950/40 px-3 py-2 text-[12px] text-red-200">
                   {formError}
@@ -1196,6 +1923,63 @@ export default function WorldBookRecords() {
               )}
 
               <form onSubmit={handleFormSubmit} className="space-y-2.5">
+                {/* Profile Photo Picker on Sign Up */}
+                {authModalMode === 'signup' && (
+                  <div className="flex items-center gap-3.5 pb-1">
+                    <div
+                      className="w-16 h-16 rounded-full border border-[#d8b35d] overflow-hidden grid place-items-center text-[#ffe6a8] font-serif text-[22px] shrink-0"
+                      style={{
+                        background: 'linear-gradient(145deg, #76572b, #242018)',
+                      }}
+                    >
+                      {avatarDraft ? (
+                        <img
+                          src={avatarDraft}
+                          alt="Profile preview"
+                          referrerPolicy="no-referrer"
+                          className="w-full h-full object-cover"
+                        />
+                      ) : fullName.trim() ? (
+                        getInitials(fullName)
+                      ) : (
+                        <User className="w-6 h-6 text-[#d8b35d]" />
+                      )}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <input
+                        ref={signupFileInputRef}
+                        type="file"
+                        accept="image/*"
+                        onChange={handleSignupAvatarPick}
+                        className="hidden"
+                        aria-label="Choose profile photo"
+                      />
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <button
+                          type="button"
+                          onClick={() => signupFileInputRef.current?.click()}
+                          className="inline-flex items-center gap-1.5 border border-[#302c25] hover:border-[#d8b35d] rounded-[8px] px-3 py-1.5 text-[12px] text-[#f7f4ed] bg-[#0d0d0f] cursor-pointer transition-colors"
+                        >
+                          <Camera className="w-3.5 h-3.5 text-[#d8b35d]" />
+                          <span>{avatarDraft ? 'Change photo' : 'Upload photo'}</span>
+                        </button>
+                        {avatarDraft && (
+                          <button
+                            type="button"
+                            onClick={() => setAvatarDraft('')}
+                            className="text-[11px] text-[#a7a3a0] hover:text-white cursor-pointer bg-transparent border-0 p-1"
+                          >
+                            Remove
+                          </button>
+                        )}
+                      </div>
+                      <p className="text-[11px] text-[#a7a3a0] mt-1 mb-0">
+                        Your photo appears at the top of your author profile.
+                      </p>
+                    </div>
+                  </div>
+                )}
+
                 {authModalMode !== 'login' && !signedInUser && (
                   <input
                     type="text"
@@ -1287,8 +2071,8 @@ export default function WorldBookRecords() {
                       aria-label="Account role"
                       className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-white outline-none"
                     >
-                      <option value="Reader account">Reader account</option>
                       <option value="Author account">Author account</option>
+                      <option value="Reader account">Reader account</option>
                     </select>
                   )
                 )}
@@ -1298,14 +2082,22 @@ export default function WorldBookRecords() {
                   disabled={submitting}
                   className="w-full mt-2 border border-[#d8b35d] rounded-[9px] px-4 py-2.5 text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] disabled:opacity-60 font-bold cursor-pointer transition-colors"
                 >
-                  {submitting ? 'Please wait…' : 'Continue'}
+                  {submitting
+                    ? 'Please wait…'
+                    : authModalMode === 'login'
+                      ? 'Log in'
+                      : authModalMode === 'signup'
+                        ? 'Create account'
+                        : 'Publish book'}
                 </button>
               </form>
 
               <p className="text-[11px] text-[#a99b7b] mt-3 mb-0">
                 {authModalMode === 'publish'
-                  ? 'Your newly published title will appear in the library grid.'
-                  : 'Create an account or sign in to publish books and manage your library.'}
+                  ? 'Your newly published title will appear under your profile and in the library grid.'
+                  : authModalMode === 'login'
+                    ? 'Sign in to view your photo, name, and published books.'
+                    : 'Sign up to set your profile photo, name, and publish your books.'}
               </p>
             </motion.div>
           </motion.div>
