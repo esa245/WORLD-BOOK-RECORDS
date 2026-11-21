@@ -11,6 +11,7 @@ export interface BookItem {
   category: BookCategory;
   type: BookAccessType;
   priceLabel: string;
+  coverImageUrl?: string;
   coverVariant: BookCoverVariant;
   coverKicker: string;
   coverFooter: string;

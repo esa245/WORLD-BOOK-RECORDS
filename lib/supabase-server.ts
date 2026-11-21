@@ -22,6 +22,7 @@ interface DbBookRow {
   category: BookCategory;
   access_type: BookAccessType;
   price_label: string;
+  cover_image_url?: string | null;
   cover_variant: BookCoverVariant;
   cover_kicker: string;
   cover_footer: string;
@@ -132,6 +133,7 @@ export async function loadInitialLibraryFromServer(): Promise<{
           category: row.category,
           type: row.access_type,
           priceLabel: row.price_label,
+          coverImageUrl: row.cover_image_url || undefined,
           coverVariant: row.cover_variant,
           coverKicker: row.cover_kicker,
           coverFooter: row.cover_footer,

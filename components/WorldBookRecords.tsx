@@ -8,10 +8,12 @@ import {
   BookOpen,
   Camera,
   Check,
+  ImagePlus,
   Menu,
   Plus,
   Search,
   Sparkles,
+  Upload,
   User,
   X,
 } from 'lucide-react';
@@ -57,6 +59,7 @@ const LOCAL_USERS_KEY = 'wbr_local_users_v1';
 const LOCAL_SESSION_KEY = 'wbr_local_session_v1';
 const LOCAL_BOOKS_KEY = 'wbr_local_books_v1';
 const AVATAR_CACHE_PREFIX = 'wbr_avatar_v1_';
+const BOOK_COVER_CACHE_PREFIX = 'wbr_book_cover_v1_';
 
 const FILTER_OPTIONS: {value: FilterOption; label: string}[] = [
   {value: 'All', label: 'All books'},
@@ -84,6 +87,7 @@ interface DbBookRow {
   category: BookCategory;
   access_type: BookAccessType;
   price_label: string;
+  cover_image_url?: string | null;
   cover_variant: BookCoverVariant;
   cover_kicker: string;
   cover_footer: string;
@@ -110,6 +114,15 @@ interface DbRecordRow {
   description: string;
 }
 
+function getCachedBookCover(bookId: string): string | undefined {
+  if (typeof window === 'undefined') return undefined;
+  try {
+    return window.localStorage.getItem(`${BOOK_COVER_CACHE_PREFIX}${bookId}`) || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function mapDbBook(row: DbBookRow): BookItem {
   return {
     id: row.id,
@@ -120,6 +133,7 @@ function mapDbBook(row: DbBookRow): BookItem {
     category: row.category,
     type: row.access_type,
     priceLabel: row.price_label,
+    coverImageUrl: row.cover_image_url || getCachedBookCover(row.id),
     coverVariant: row.cover_variant,
     coverKicker: row.cover_kicker,
     coverFooter: row.cover_footer,
@@ -174,6 +188,62 @@ async function resizeImageToAvatar(file: File): Promise<string> {
         const sy = (img.height - minSide) / 2;
         ctx.drawImage(img, sx, sy, minSide, minSide, 0, 0, size, size);
         resolve(canvas.toDataURL('image/jpeg', 0.78));
+      };
+      img.src = String(reader.result || '');
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+async function resizeBookCoverImage(file: File): Promise<{
+  dataUrl: string;
+  originalWidth: number;
+  originalHeight: number;
+}> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Failed to read cover image file.'));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error('Unsupported cover image format.'));
+      img.onload = () => {
+        const targetWidth = 480;
+        const targetHeight = 720; // 2:3 vertical book cover ratio
+        const canvas = document.createElement('canvas');
+        canvas.width = targetWidth;
+        canvas.height = targetHeight;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          resolve({
+            dataUrl: String(reader.result || ''),
+            originalWidth: img.width,
+            originalHeight: img.height,
+          });
+          return;
+        }
+
+        // Center-crop to 2:3 portrait aspect ratio
+        const targetRatio = targetWidth / targetHeight;
+        const sourceRatio = img.width / img.height;
+        let sx = 0;
+        let sy = 0;
+        let sw = img.width;
+        let sh = img.height;
+
+        if (sourceRatio > targetRatio) {
+          sw = img.height * targetRatio;
+          sx = (img.width - sw) / 2;
+        } else {
+          sh = img.width / targetRatio;
+          sy = (img.height - sh) / 2;
+        }
+
+        ctx.drawImage(img, sx, sy, sw, sh, 0, 0, targetWidth, targetHeight);
+        resolve({
+          dataUrl: canvas.toDataURL('image/jpeg', 0.82),
+          originalWidth: img.width,
+          originalHeight: img.height,
+        });
       };
       img.src = String(reader.result || '');
     };
@@ -243,6 +313,10 @@ export default function WorldBookRecords({
     'Author account',
   );
   const [bookTitleInput, setBookTitleInput] = useState('');
+  const [bookDescriptionInput, setBookDescriptionInput] = useState('');
+  const [bookCoverDraft, setBookCoverDraft] = useState<string>('');
+  const [bookCoverMeta, setBookCoverMeta] = useState<string>('');
+  const [bookCoverErrors, setBookCoverErrors] = useState<Record<string, boolean>>({});
   const [bookCategoryInput, setBookCategoryInput] = useState<BookCategory>('Fiction');
   const [bookAccessInput, setBookAccessInput] = useState<BookAccessType>('Free');
   const [bookPriceInput, setBookPriceInput] = useState('$4.99');
@@ -253,6 +327,7 @@ export default function WorldBookRecords({
 
   const signupFileInputRef = useRef<HTMLInputElement | null>(null);
   const profileFileInputRef = useRef<HTMLInputElement | null>(null);
+  const bookCoverFileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -347,6 +422,13 @@ export default function WorldBookRecords({
             const uniqueLocal = localBooks.filter((b) => !existingIds.has(b.id));
             return [...uniqueLocal, ...prev];
           });
+        } else {
+          setBooks((prev) =>
+            prev.map((book) => ({
+              ...book,
+              coverImageUrl: book.coverImageUrl || getCachedBookCover(book.id),
+            })),
+          );
         }
       };
       restoreLocal();
@@ -493,6 +575,29 @@ export default function WorldBookRecords({
       setFormError(null);
     } catch {
       setFormError('Could not process that image. Please choose a JPG or PNG photo.');
+    }
+  };
+
+  const handleBookCoverPick = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (file.size > 5 * 1024 * 1024) {
+      setFormError('Cover image must be 5 MB or smaller.');
+      return;
+    }
+    try {
+      const {dataUrl, originalWidth, originalHeight} =
+        await resizeBookCoverImage(file);
+      const sizeKb = Math.max(1, Math.round(file.size / 1024));
+      setBookCoverDraft(dataUrl);
+      setBookCoverMeta(
+        `Original: ${originalWidth} × ${originalHeight} px (${sizeKb} KB) · Saved as 480 × 720 px (2:3)`,
+      );
+      setFormError(null);
+    } catch {
+      setFormError(
+        'Could not process that cover image. Please upload a JPG, PNG, or WebP file.',
+      );
     }
   };
 
@@ -724,6 +829,22 @@ export default function WorldBookRecords({
             }
           }
 
+          if (!bookTitleInput.trim()) {
+            setFormError('Please enter your book title.');
+            setSubmitting(false);
+            return;
+          }
+          if (!bookDescriptionInput.trim()) {
+            setFormError('Please write a description for your book.');
+            setSubmitting(false);
+            return;
+          }
+          if (bookAccessInput === 'Paid' && !bookPriceInput.trim()) {
+            setFormError('Please enter a price for your paid edition.');
+            setSubmitting(false);
+            return;
+          }
+
           const words = bookTitleInput.trim().split(/\s+/);
           const splitIdx = Math.ceil(words.length / 2);
           const line1 = words.slice(0, splitIdx).join(' ');
@@ -733,30 +854,48 @@ export default function WorldBookRecords({
           const priceLabel =
             bookAccessInput === 'Free' ? 'Free' : bookPriceInput.trim() || '$4.99';
           const newId = `book-${Date.now()}`;
+          const descriptionText = bookDescriptionInput.trim();
 
-          const {data: insertedBook, error: insertError} = await supabaseClient
+          const basePayload = {
+            id: newId,
+            user_id: activeUserId,
+            title: bookTitleInput.trim(),
+            title_line_1: line1,
+            title_line_2: line2,
+            author_name: displayName,
+            category: bookCategoryInput,
+            access_type: bookAccessInput,
+            price_label: priceLabel,
+            cover_variant: variant,
+            cover_kicker: 'WORLD BOOK RECORDS',
+            cover_footer: `BY ${displayName.toUpperCase()}`,
+            pages: 210,
+            published_year: 2026,
+            synopsis: descriptionText,
+            excerpt: descriptionText,
+          };
+
+          let {data: insertedBook, error: insertError} = await supabaseClient
             .from('books')
             .insert({
-              id: newId,
-              user_id: activeUserId,
-              title: bookTitleInput.trim(),
-              title_line_1: line1,
-              title_line_2: line2,
-              author_name: displayName,
-              category: bookCategoryInput,
-              access_type: bookAccessInput,
-              price_label: priceLabel,
-              cover_variant: variant,
-              cover_kicker: 'WORLD BOOK RECORDS',
-              cover_footer: `BY ${displayName.toUpperCase()}`,
-              pages: 210,
-              published_year: 2026,
-              synopsis: `Published to the World Book Records library by ${displayName}.`,
-              excerpt:
-                'Every story begins with a single page shared openly with readers across borders.',
+              ...basePayload,
+              cover_image_url: bookCoverDraft || null,
             })
             .select()
             .single();
+
+          if (
+            insertError &&
+            insertError.message.toLowerCase().includes('cover_image_url')
+          ) {
+            const retryRes = await supabaseClient
+              .from('books')
+              .insert(basePayload)
+              .select()
+              .single();
+            insertedBook = retryRes.data;
+            insertError = retryRes.error;
+          }
 
           if (insertError) {
             setFormError(insertError.message);
@@ -764,8 +903,23 @@ export default function WorldBookRecords({
             return;
           }
 
+          if (bookCoverDraft) {
+            try {
+              window.localStorage.setItem(
+                `${BOOK_COVER_CACHE_PREFIX}${newId}`,
+                bookCoverDraft,
+              );
+            } catch {
+              // Ignore localStorage quota errors
+            }
+          }
+
           if (insertedBook) {
-            setBooks((prev) => [mapDbBook(insertedBook as DbBookRow), ...prev]);
+            const mapped = mapDbBook(insertedBook as DbBookRow);
+            if (!mapped.coverImageUrl && bookCoverDraft) {
+              mapped.coverImageUrl = bookCoverDraft;
+            }
+            setBooks((prev) => [mapped, ...prev]);
           }
 
           if (
@@ -784,7 +938,7 @@ export default function WorldBookRecords({
                 country: 'Global',
                 genre: bookCategoryInput,
                 published_count: 1,
-                bio: `Author of "${bookTitleInput.trim()}" on World Book Records.`,
+                bio: descriptionText.slice(0, 160),
               })
               .select()
               .single();
@@ -797,6 +951,9 @@ export default function WorldBookRecords({
             `"${bookTitleInput.trim()}" has been published to World Book Records.`,
           );
           setBookTitleInput('');
+          setBookDescriptionInput('');
+          setBookCoverDraft('');
+          setBookCoverMeta('');
           setAuthModalMode(null);
           setPassword('');
           scrollToProfile();
@@ -872,7 +1029,23 @@ export default function WorldBookRecords({
         return;
       }
 
-      if (authModalMode === 'publish' && bookTitleInput.trim()) {
+      if (authModalMode === 'publish') {
+        if (!bookTitleInput.trim()) {
+          setFormError('Please enter your book title.');
+          setSubmitting(false);
+          return;
+        }
+        if (!bookDescriptionInput.trim()) {
+          setFormError('Please write a description for your book.');
+          setSubmitting(false);
+          return;
+        }
+        if (bookAccessInput === 'Paid' && !bookPriceInput.trim()) {
+          setFormError('Please enter a price for your paid edition.');
+          setSubmitting(false);
+          return;
+        }
+
         let currentSession = signedInUser;
         if (!currentSession) {
           const existing = localUsers.find((u) => u.email === trimmedEmail);
@@ -919,6 +1092,7 @@ export default function WorldBookRecords({
         const variant = variants[books.length % variants.length];
         const priceLabel =
           bookAccessInput === 'Free' ? 'Free' : bookPriceInput.trim() || '$4.99';
+        const descriptionText = bookDescriptionInput.trim();
 
         const newBook: BookItem = {
           id: `book-${Date.now()}`,
@@ -929,14 +1103,14 @@ export default function WorldBookRecords({
           category: bookCategoryInput,
           type: bookAccessInput,
           priceLabel,
+          coverImageUrl: bookCoverDraft || undefined,
           coverVariant: variant,
           coverKicker: 'WORLD BOOK RECORDS',
           coverFooter: `BY ${currentSession.name.toUpperCase()}`,
           pages: 210,
           publishedYear: 2026,
-          synopsis: `Published to the World Book Records library by ${currentSession.name}.`,
-          excerpt:
-            'Every story begins with a single page shared openly with readers across borders.',
+          synopsis: descriptionText,
+          excerpt: descriptionText,
         };
 
         const existingLocalBooks = readLocalJson<BookItem[]>(LOCAL_BOOKS_KEY, []);
@@ -946,6 +1120,9 @@ export default function WorldBookRecords({
           `"${newBook.title}" has been published to your profile and library.`,
         );
         setBookTitleInput('');
+        setBookDescriptionInput('');
+        setBookCoverDraft('');
+        setBookCoverMeta('');
         setAuthModalMode(null);
         setPassword('');
         scrollToProfile();
@@ -973,8 +1150,8 @@ export default function WorldBookRecords({
       desc: 'Create your reader or author account.',
     },
     publish: {
-      title: 'Start your author journey',
-      desc: 'Publish a new book directly to your profile and the global library.',
+      title: 'Upload & publish a book',
+      desc: 'Add your cover photo, book title, description, and price.',
     },
   };
 
@@ -1400,23 +1577,47 @@ export default function WorldBookRecords({
                     className="bg-[#141417] border border-[#292621] rounded-[13px] p-[13px] transition duration-200 hover:-translate-y-1 hover:border-[#806633] cursor-pointer focus-visible:outline-2 focus-visible:outline-[#d8b35d]"
                   >
                     <div
-                      className={`h-[165px] sm:h-[205px] rounded-[7px] p-[13px] sm:p-[17px] flex flex-col justify-between shadow-[inset_5px_0_rgba(255,255,255,0.08)] relative overflow-hidden ${COVER_GRADIENTS[book.coverVariant]}`}
+                      className={`h-[165px] sm:h-[205px] rounded-[7px] flex flex-col justify-between shadow-[inset_5px_0_rgba(255,255,255,0.08)] relative overflow-hidden ${COVER_GRADIENTS[book.coverVariant]} ${
+                        book.coverImageUrl && !bookCoverErrors[book.id]
+                          ? ''
+                          : 'p-[13px] sm:p-[17px]'
+                      }`}
                     >
-                      <span
-                        aria-hidden="true"
-                        className="absolute w-[160px] h-[160px] border border-white/15 rounded-full -right-[60px] -bottom-[55px] pointer-events-none"
-                      />
-                      <small className="text-[9px] tracking-[2px] opacity-80">
-                        {book.coverKicker}
-                      </small>
-                      <strong className="font-serif text-[21px] sm:text-[26px] leading-[1.08] max-w-[150px] font-normal">
-                        {book.titleLines[0]}
-                        <br />
-                        {book.titleLines[1]}
-                      </strong>
-                      <span className="text-[9px] tracking-[1.5px]">
-                        {book.coverFooter}
-                      </span>
+                      {book.coverImageUrl && !bookCoverErrors[book.id] ? (
+                        <>
+                          <img
+                            src={book.coverImageUrl}
+                            alt={`${book.title} cover`}
+                            referrerPolicy="no-referrer"
+                            onError={() =>
+                              setBookCoverErrors((prev) => ({...prev, [book.id]: true}))
+                            }
+                            className="w-full h-full object-cover"
+                          />
+                          <div
+                            aria-hidden="true"
+                            className="absolute inset-0 shadow-[inset_6px_0_12px_rgba(0,0,0,0.45)] pointer-events-none"
+                          />
+                        </>
+                      ) : (
+                        <>
+                          <span
+                            aria-hidden="true"
+                            className="absolute w-[160px] h-[160px] border border-white/15 rounded-full -right-[60px] -bottom-[55px] pointer-events-none"
+                          />
+                          <small className="text-[9px] tracking-[2px] opacity-80">
+                            {book.coverKicker}
+                          </small>
+                          <strong className="font-serif text-[21px] sm:text-[26px] leading-[1.08] max-w-[150px] font-normal">
+                            {book.titleLines[0]}
+                            <br />
+                            {book.titleLines[1]}
+                          </strong>
+                          <span className="text-[9px] tracking-[1.5px]">
+                            {book.coverFooter}
+                          </span>
+                        </>
+                      )}
                     </div>
 
                     <div className="pt-[12px] px-[2px] pb-[3px]">
@@ -1725,8 +1926,8 @@ export default function WorldBookRecords({
                     }}
                     className="inline-flex items-center gap-1.5 border border-[#d8b35d] rounded-[9px] px-4 py-2 text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] font-bold text-[13px] cursor-pointer transition-colors"
                   >
-                    <Plus className="w-4 h-4" />
-                    <span>Publish a new book</span>
+                    <Upload className="w-4 h-4" />
+                    <span>Upload &amp; publish book</span>
                   </button>
                   <button
                     type="button"
@@ -1778,23 +1979,50 @@ export default function WorldBookRecords({
                         className="bg-[#0d0d10] border border-[#292621] rounded-[13px] p-3 transition duration-200 hover:-translate-y-1 hover:border-[#806633] cursor-pointer focus-visible:outline-2 focus-visible:outline-[#d8b35d]"
                       >
                         <div
-                          className={`h-[155px] sm:h-[185px] rounded-[7px] p-3.5 flex flex-col justify-between shadow-[inset_5px_0_rgba(255,255,255,0.08)] relative overflow-hidden ${COVER_GRADIENTS[book.coverVariant]}`}
+                          className={`h-[155px] sm:h-[185px] rounded-[7px] flex flex-col justify-between shadow-[inset_5px_0_rgba(255,255,255,0.08)] relative overflow-hidden ${COVER_GRADIENTS[book.coverVariant]} ${
+                            book.coverImageUrl && !bookCoverErrors[book.id]
+                              ? ''
+                              : 'p-3.5'
+                          }`}
                         >
-                          <span
-                            aria-hidden="true"
-                            className="absolute w-[140px] h-[140px] border border-white/15 rounded-full -right-[50px] -bottom-[45px] pointer-events-none"
-                          />
-                          <small className="text-[8px] tracking-[2px] opacity-80">
-                            {book.coverKicker}
-                          </small>
-                          <strong className="font-serif text-[19px] sm:text-[22px] leading-[1.08] max-w-[140px] font-normal">
-                            {book.titleLines[0]}
-                            <br />
-                            {book.titleLines[1]}
-                          </strong>
-                          <span className="text-[8px] tracking-[1.5px]">
-                            {book.coverFooter}
-                          </span>
+                          {book.coverImageUrl && !bookCoverErrors[book.id] ? (
+                            <>
+                              <img
+                                src={book.coverImageUrl}
+                                alt={`${book.title} cover`}
+                                referrerPolicy="no-referrer"
+                                onError={() =>
+                                  setBookCoverErrors((prev) => ({
+                                    ...prev,
+                                    [book.id]: true,
+                                  }))
+                                }
+                                className="w-full h-full object-cover"
+                              />
+                              <div
+                                aria-hidden="true"
+                                className="absolute inset-0 shadow-[inset_6px_0_12px_rgba(0,0,0,0.45)] pointer-events-none"
+                              />
+                            </>
+                          ) : (
+                            <>
+                              <span
+                                aria-hidden="true"
+                                className="absolute w-[140px] h-[140px] border border-white/15 rounded-full -right-[50px] -bottom-[45px] pointer-events-none"
+                              />
+                              <small className="text-[8px] tracking-[2px] opacity-80">
+                                {book.coverKicker}
+                              </small>
+                              <strong className="font-serif text-[19px] sm:text-[22px] leading-[1.08] max-w-[140px] font-normal">
+                                {book.titleLines[0]}
+                                <br />
+                                {book.titleLines[1]}
+                              </strong>
+                              <span className="text-[8px] tracking-[1.5px]">
+                                {book.coverFooter}
+                              </span>
+                            </>
+                          )}
                         </div>
 
                         <div className="pt-2.5 px-0.5 pb-0.5">
@@ -1864,7 +2092,9 @@ export default function WorldBookRecords({
               animate={{opacity: 1, scale: 1, y: 0}}
               exit={{opacity: 0, scale: 0.97, y: 8}}
               transition={{duration: 0.16}}
-              className="w-[min(480px,100%)] max-h-[90vh] overflow-y-auto bg-[#171619] border border-[#66512d] rounded-[16px] p-[25px] relative"
+              className={`${
+                authModalMode === 'publish' ? 'w-[min(560px,100%)]' : 'w-[min(480px,100%)]'
+              } max-h-[90vh] overflow-y-auto bg-[#171619] border border-[#66512d] rounded-[16px] p-[25px] relative`}
             >
               <button
                 type="button"
@@ -2015,50 +2245,190 @@ export default function WorldBookRecords({
                 )}
 
                 {authModalMode === 'publish' ? (
-                  <>
-                    <input
-                      type="text"
-                      required
-                      value={bookTitleInput}
-                      onChange={(e) => setBookTitleInput(e.target.value)}
-                      placeholder="Book title (e.g. Echoes of Dawn)"
-                      className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-white outline-none"
-                    />
-                    <div className="grid grid-cols-2 gap-2.5">
-                      <select
-                        value={bookCategoryInput}
-                        onChange={(e) =>
-                          setBookCategoryInput(e.target.value as BookCategory)
-                        }
-                        aria-label="Book category"
-                        className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-white outline-none"
-                      >
-                        <option value="Fiction">Fiction</option>
-                        <option value="History">History</option>
-                        <option value="Science">Science</option>
-                      </select>
-                      <select
-                        value={bookAccessInput}
-                        onChange={(e) =>
-                          setBookAccessInput(e.target.value as BookAccessType)
-                        }
-                        aria-label="Access type"
-                        className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-white outline-none"
-                      >
-                        <option value="Free">Free access</option>
-                        <option value="Paid">Paid edition</option>
-                      </select>
+                  <div className="space-y-3">
+                    {/* Book Cover Upload + Size Guidance */}
+                    <div className="bg-[#0d0d10] border border-[#302c25] rounded-[12px] p-3.5">
+                      <div className="flex items-start gap-3.5">
+                        <div
+                          onClick={() => bookCoverFileInputRef.current?.click()}
+                          role="button"
+                          tabIndex={0}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' || e.key === ' ') {
+                              e.preventDefault();
+                              bookCoverFileInputRef.current?.click();
+                            }
+                          }}
+                          aria-label="Choose book cover image"
+                          className="w-[92px] h-[138px] shrink-0 rounded-[7px] border border-dashed border-[#66512d] hover:border-[#d8b35d] bg-[#141417] overflow-hidden relative cursor-pointer grid place-items-center transition-colors"
+                        >
+                          {bookCoverDraft ? (
+                            <img
+                              src={bookCoverDraft}
+                              alt="Book cover preview"
+                              referrerPolicy="no-referrer"
+                              className="w-full h-full object-cover"
+                            />
+                          ) : (
+                            <div className="p-2 text-center flex flex-col items-center gap-1.5">
+                              <ImagePlus className="w-5 h-5 text-[#d8b35d]" />
+                              <span className="text-[10px] leading-tight text-[#d2cec5]">
+                                Cover 2:3
+                              </span>
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="flex-1 min-w-0">
+                          <div className="text-[12px] font-bold text-[#f7f4ed] mb-1">
+                            Book Cover Photo
+                          </div>
+                          <div className="text-[11px] text-[#d8b35d] font-semibold">
+                            Recommended size: 600 × 900 px (2:3 portrait)
+                          </div>
+                          <p className="text-[11px] text-[#a7a3a0] mt-0.5 mb-2.5 leading-snug">
+                            Supports JPG, PNG, or WebP up to 5 MB. Automatically cropped
+                            &amp; resized to 480 × 720 px for crisp library cards.
+                          </p>
+
+                          <input
+                            ref={bookCoverFileInputRef}
+                            type="file"
+                            accept="image/jpeg,image/png,image/webp,image/*"
+                            onChange={handleBookCoverPick}
+                            className="hidden"
+                            aria-label="Upload book cover photo"
+                          />
+
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <button
+                              type="button"
+                              onClick={() => bookCoverFileInputRef.current?.click()}
+                              className="inline-flex items-center gap-1.5 border border-[#d8b35d] rounded-[8px] px-3 py-1.5 text-[12px] font-semibold text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] cursor-pointer transition-colors"
+                            >
+                              <Upload className="w-3.5 h-3.5" />
+                              <span>
+                                {bookCoverDraft ? 'Change cover' : 'Upload cover'}
+                              </span>
+                            </button>
+                            {bookCoverDraft && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setBookCoverDraft('');
+                                  setBookCoverMeta('');
+                                }}
+                                className="text-[11px] text-[#a7a3a0] hover:text-white cursor-pointer bg-transparent border-0 p-1"
+                              >
+                                Remove
+                              </button>
+                            )}
+                          </div>
+
+                          {bookCoverMeta && (
+                            <p className="text-[10.5px] text-[#d7c18e] mt-2 mb-0">
+                              {bookCoverMeta}
+                            </p>
+                          )}
+                        </div>
+                      </div>
                     </div>
-                    {bookAccessInput === 'Paid' && (
+
+                    {/* Title */}
+                    <div>
+                      <label className="block text-[11px] font-bold uppercase tracking-[1.5px] text-[#d7c18e] mb-1">
+                        Book Title *
+                      </label>
                       <input
                         type="text"
-                        value={bookPriceInput}
-                        onChange={(e) => setBookPriceInput(e.target.value)}
-                        placeholder="Edition price (e.g. $4.99)"
+                        required
+                        value={bookTitleInput}
+                        onChange={(e) => setBookTitleInput(e.target.value)}
+                        placeholder="e.g. Echoes of Dawn"
                         className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-white outline-none"
                       />
-                    )}
-                  </>
+                    </div>
+
+                    {/* Description */}
+                    <div>
+                      <label className="block text-[11px] font-bold uppercase tracking-[1.5px] text-[#d7c18e] mb-1">
+                        Book Description *
+                      </label>
+                      <textarea
+                        required
+                        rows={3}
+                        value={bookDescriptionInput}
+                        onChange={(e) => setBookDescriptionInput(e.target.value)}
+                        placeholder="Write a summary or description of your book for readers..."
+                        className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-white outline-none resize-y text-[13.5px] leading-relaxed"
+                      />
+                    </div>
+
+                    {/* Category & Pricing */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                      <div>
+                        <label className="block text-[11px] font-bold uppercase tracking-[1.5px] text-[#d7c18e] mb-1">
+                          Category
+                        </label>
+                        <select
+                          value={bookCategoryInput}
+                          onChange={(e) =>
+                            setBookCategoryInput(e.target.value as BookCategory)
+                          }
+                          aria-label="Book category"
+                          className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-white outline-none"
+                        >
+                          <option value="Fiction">Fiction</option>
+                          <option value="History">History</option>
+                          <option value="Science">Science</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block text-[11px] font-bold uppercase tracking-[1.5px] text-[#d7c18e] mb-1">
+                          Price Option
+                        </label>
+                        <select
+                          value={bookAccessInput}
+                          onChange={(e) =>
+                            setBookAccessInput(e.target.value as BookAccessType)
+                          }
+                          aria-label="Price option"
+                          className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-white outline-none"
+                        >
+                          <option value="Free">Free (Open access)</option>
+                          <option value="Paid">Paid edition (Set price)</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="block text-[11px] font-bold uppercase tracking-[1.5px] text-[#d7c18e] mb-1">
+                        {bookAccessInput === 'Paid' ? 'Price *' : 'Price'}
+                      </label>
+                      {bookAccessInput === 'Paid' ? (
+                        <input
+                          type="text"
+                          required
+                          value={bookPriceInput}
+                          onChange={(e) => setBookPriceInput(e.target.value)}
+                          placeholder="Enter price (e.g. $4.99 or ৳250)"
+                          className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-white outline-none"
+                        />
+                      ) : (
+                        <div className="w-full px-3 py-2.5 bg-[#0d0d0f] border border-[#302c25] rounded-[8px] text-[13px] text-[#d8b35d] flex items-center justify-between">
+                          <span>Free ($0)</span>
+                          <button
+                            type="button"
+                            onClick={() => setBookAccessInput('Paid')}
+                            className="text-[11px] text-[#f2d58b] underline underline-offset-2 cursor-pointer bg-transparent border-0 p-0"
+                          >
+                            Set a paid price
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
                 ) : (
                   authModalMode === 'signup' && (
                     <select
@@ -2088,7 +2458,7 @@ export default function WorldBookRecords({
                       ? 'Log in'
                       : authModalMode === 'signup'
                         ? 'Create account'
-                        : 'Publish book'}
+                        : 'Upload & publish book'}
                 </button>
               </form>
 
@@ -2138,19 +2508,46 @@ export default function WorldBookRecords({
 
               <div className="flex flex-col sm:flex-row gap-5">
                 <div
-                  className={`w-[150px] h-[205px] shrink-0 rounded-[7px] p-4 flex flex-col justify-between shadow-[inset_5px_0_rgba(255,255,255,0.08)] relative overflow-hidden ${COVER_GRADIENTS[selectedBook.coverVariant]}`}
+                  className={`w-[150px] h-[225px] shrink-0 rounded-[7px] flex flex-col justify-between shadow-[inset_5px_0_rgba(255,255,255,0.08)] relative overflow-hidden ${COVER_GRADIENTS[selectedBook.coverVariant]} ${
+                    selectedBook.coverImageUrl && !bookCoverErrors[selectedBook.id]
+                      ? ''
+                      : 'p-4'
+                  }`}
                 >
-                  <small className="text-[8px] tracking-[2px] opacity-80">
-                    {selectedBook.coverKicker}
-                  </small>
-                  <strong className="font-serif text-[21px] leading-[1.08] font-normal">
-                    {selectedBook.titleLines[0]}
-                    <br />
-                    {selectedBook.titleLines[1]}
-                  </strong>
-                  <span className="text-[8px] tracking-[1.5px]">
-                    {selectedBook.coverFooter}
-                  </span>
+                  {selectedBook.coverImageUrl && !bookCoverErrors[selectedBook.id] ? (
+                    <>
+                      <img
+                        src={selectedBook.coverImageUrl}
+                        alt={`${selectedBook.title} cover`}
+                        referrerPolicy="no-referrer"
+                        onError={() =>
+                          setBookCoverErrors((prev) => ({
+                            ...prev,
+                            [selectedBook.id]: true,
+                          }))
+                        }
+                        className="w-full h-full object-cover"
+                      />
+                      <div
+                        aria-hidden="true"
+                        className="absolute inset-0 shadow-[inset_6px_0_12px_rgba(0,0,0,0.45)] pointer-events-none"
+                      />
+                    </>
+                  ) : (
+                    <>
+                      <small className="text-[8px] tracking-[2px] opacity-80">
+                        {selectedBook.coverKicker}
+                      </small>
+                      <strong className="font-serif text-[21px] leading-[1.08] font-normal">
+                        {selectedBook.titleLines[0]}
+                        <br />
+                        {selectedBook.titleLines[1]}
+                      </strong>
+                      <span className="text-[8px] tracking-[1.5px]">
+                        {selectedBook.coverFooter}
+                      </span>
+                    </>
+                  )}
                 </div>
 
                 <div className="flex-1 min-w-0">
