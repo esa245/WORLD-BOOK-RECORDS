@@ -158,6 +158,22 @@ create policy "Public can read literary records"
   on public.literary_records for select
   using (true);
 
+-- Ensure anonymous and signed-in visitors can read public catalog tables
+grant usage on schema public to anon, authenticated;
+grant select on public.books, public.authors, public.literary_records to anon, authenticated;
+grant insert, update, delete on public.books to authenticated;
+grant insert, update on public.authors to authenticated;
+grant select, insert, update on public.profiles to authenticated;
+
+-- Enable live updates for newly published books (safe if already enabled)
+do $$
+begin
+  alter publication supabase_realtime add table public.books;
+exception
+  when duplicate_object then null;
+  when others then null;
+end $$;
+
 -- 5. Seed Initial Data
 insert into public.authors (id, initials, name, verified, country, genre, published_count, bio)
 values

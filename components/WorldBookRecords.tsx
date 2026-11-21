@@ -499,6 +499,25 @@ export default function WorldBookRecords({
     loadCatalog();
     syncSession();
 
+    const refreshOnFocus = () => {
+      if (document.visibilityState === 'visible') {
+        loadCatalog();
+      }
+    };
+    window.addEventListener('focus', refreshOnFocus);
+    document.addEventListener('visibilitychange', refreshOnFocus);
+
+    const realtimeChannel = supabaseClient
+      .channel('wbr_books_live')
+      .on(
+        'postgres_changes',
+        {event: '*', schema: 'public', table: 'books'},
+        () => {
+          loadCatalog();
+        },
+      )
+      .subscribe();
+
     const {data: authSub} = supabaseClient.auth.onAuthStateChange(
       async (_event, session) => {
         if (!isMounted) return;
@@ -525,6 +544,9 @@ export default function WorldBookRecords({
 
     return () => {
       isMounted = false;
+      window.removeEventListener('focus', refreshOnFocus);
+      document.removeEventListener('visibilitychange', refreshOnFocus);
+      supabaseClient.removeChannel(realtimeChannel);
       authSub.subscription.unsubscribe();
     };
   }, [supabaseClient]);
@@ -1117,7 +1139,7 @@ export default function WorldBookRecords({
         writeLocalJson(LOCAL_BOOKS_KEY, [newBook, ...existingLocalBooks]);
         setBooks((prev) => [newBook, ...prev]);
         setFeedbackBanner(
-          `"${newBook.title}" has been published to your profile and library.`,
+          `"${newBook.title}" saved in this browser only. Connect Supabase Secrets so everyone can see it.`,
         );
         setBookTitleInput('');
         setBookDescriptionInput('');
@@ -2464,7 +2486,9 @@ export default function WorldBookRecords({
 
               <p className="text-[11px] text-[#a99b7b] mt-3 mb-0">
                 {authModalMode === 'publish'
-                  ? 'Your newly published title will appear under your profile and in the library grid.'
+                  ? supabaseClient
+                    ? 'Your newly published title will appear under your profile and for all visitors in the global library.'
+                    : 'Browser-only mode: Connect NEXT_PUBLIC_SUPABASE_URL & NEXT_PUBLIC_SUPABASE_ANON_KEY (sb_publishable_...) in Secrets so everyone can see your uploaded books.'
                   : authModalMode === 'login'
                     ? 'Sign in to view your photo, name, and published books.'
                     : 'Sign up to set your profile photo, name, and publish your books.'}
