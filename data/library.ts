@@ -12,6 +12,9 @@ export interface BookItem {
   type: BookAccessType;
   priceLabel: string;
   coverImageUrl?: string;
+  bookFileUrl?: string;
+  bookFileName?: string;
+  bookFileSize?: string;
   coverVariant: BookCoverVariant;
   coverKicker: string;
   coverFooter: string;

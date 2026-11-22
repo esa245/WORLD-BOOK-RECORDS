@@ -101,6 +101,9 @@ create table if not exists public.books (
   access_type text not null check (access_type in ('Free', 'Paid')),
   price_label text not null default 'Free',
   cover_image_url text,
+  book_file_url text,
+  book_file_name text,
+  book_file_size text,
   cover_variant text not null default 'c1' check (cover_variant in ('c1', 'c2', 'c3', 'c4')),
   cover_kicker text not null default 'WORLD BOOK RECORDS',
   cover_footer text not null,
@@ -112,6 +115,9 @@ create table if not exists public.books (
 );
 
 alter table public.books add column if not exists cover_image_url text;
+alter table public.books add column if not exists book_file_url text;
+alter table public.books add column if not exists book_file_name text;
+alter table public.books add column if not exists book_file_size text;
 
 create index if not exists idx_books_category on public.books(category);
 create index if not exists idx_books_access_type on public.books(access_type);

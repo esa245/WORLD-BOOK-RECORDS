@@ -8,6 +8,8 @@ import {
   BookOpen,
   Camera,
   Check,
+  Download,
+  FileText,
   ImagePlus,
   Menu,
   Plus,
@@ -60,6 +62,80 @@ const LOCAL_SESSION_KEY = 'wbr_local_session_v1';
 const LOCAL_BOOKS_KEY = 'wbr_local_books_v1';
 const AVATAR_CACHE_PREFIX = 'wbr_avatar_v1_';
 const BOOK_COVER_CACHE_PREFIX = 'wbr_book_cover_v1_';
+const BOOK_FILE_CACHE_PREFIX = 'wbr_book_file_v1_';
+
+const BLOCKED_MEDIA_EXTENSIONS = new Set([
+  'jpg',
+  'jpeg',
+  'png',
+  'gif',
+  'webp',
+  'svg',
+  'bmp',
+  'ico',
+  'tif',
+  'tiff',
+  'heic',
+  'heif',
+  'avif',
+  'raw',
+  'cr2',
+  'nef',
+  'psd',
+  'mp4',
+  'mov',
+  'avi',
+  'mkv',
+  'webm',
+  'flv',
+  'wmv',
+  'm4v',
+  '3gp',
+  '3g2',
+  'mpeg',
+  'mpg',
+  'ts',
+  'mts',
+  'vob',
+  'ogv',
+]);
+
+function isBlockedMediaFile(file: File): boolean {
+  const mime = (file.type || '').toLowerCase();
+  if (mime.startsWith('image/') || mime.startsWith('video/')) {
+    return true;
+  }
+  const ext = file.name.split('.').pop()?.toLowerCase() || '';
+  return BLOCKED_MEDIA_EXTENSIONS.has(ext);
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function getFileExtensionLabel(fileName?: string): string {
+  if (!fileName) return 'FILE';
+  const ext = fileName.split('.').pop()?.trim().toUpperCase();
+  return ext && ext.length <= 6 ? ext : 'FILE';
+}
+
+function isPdfBookFile(fileName?: string, fileUrl?: string): boolean {
+  return Boolean(
+    fileName?.toLowerCase().endsWith('.pdf') ||
+      fileUrl?.toLowerCase().startsWith('data:application/pdf'),
+  );
+}
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Failed to read file.'));
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.readAsDataURL(file);
+  });
+}
 
 const FILTER_OPTIONS: {value: FilterOption; label: string}[] = [
   {value: 'All', label: 'All books'},
@@ -88,6 +164,9 @@ interface DbBookRow {
   access_type: BookAccessType;
   price_label: string;
   cover_image_url?: string | null;
+  book_file_url?: string | null;
+  book_file_name?: string | null;
+  book_file_size?: string | null;
   cover_variant: BookCoverVariant;
   cover_kicker: string;
   cover_footer: string;
@@ -123,7 +202,21 @@ function getCachedBookCover(bookId: string): string | undefined {
   }
 }
 
+function getCachedBookFile(
+  bookId: string,
+): {url?: string; name?: string; size?: string} {
+  if (typeof window === 'undefined') return {};
+  try {
+    const raw = window.localStorage.getItem(`${BOOK_FILE_CACHE_PREFIX}${bookId}`);
+    if (!raw) return {};
+    return JSON.parse(raw) as {url?: string; name?: string; size?: string};
+  } catch {
+    return {};
+  }
+}
+
 function mapDbBook(row: DbBookRow): BookItem {
+  const cachedFile = getCachedBookFile(row.id);
   return {
     id: row.id,
     userId: row.user_id || undefined,
@@ -134,6 +227,9 @@ function mapDbBook(row: DbBookRow): BookItem {
     type: row.access_type,
     priceLabel: row.price_label,
     coverImageUrl: row.cover_image_url || getCachedBookCover(row.id),
+    bookFileUrl: row.book_file_url || cachedFile.url,
+    bookFileName: row.book_file_name || cachedFile.name,
+    bookFileSize: row.book_file_size || cachedFile.size,
     coverVariant: row.cover_variant,
     coverKicker: row.cover_kicker,
     coverFooter: row.cover_footer,
@@ -317,6 +413,14 @@ export default function WorldBookRecords({
   const [bookCoverDraft, setBookCoverDraft] = useState<string>('');
   const [bookCoverMeta, setBookCoverMeta] = useState<string>('');
   const [bookCoverErrors, setBookCoverErrors] = useState<Record<string, boolean>>({});
+  const [bookFileDraft, setBookFileDraft] = useState<string>('');
+  const [bookFileNameDraft, setBookFileNameDraft] = useState<string>('');
+  const [bookFileSizeDraft, setBookFileSizeDraft] = useState<string>('');
+  const [pdfPreviewOpen, setPdfPreviewOpen] = useState(false);
+  const [pdfPreviewBlobUrl, setPdfPreviewBlobUrl] = useState<{
+    bookId: string;
+    url: string;
+  } | null>(null);
   const [bookCategoryInput, setBookCategoryInput] = useState<BookCategory>('Fiction');
   const [bookAccessInput, setBookAccessInput] = useState<BookAccessType>('Free');
   const [bookPriceInput, setBookPriceInput] = useState('$4.99');
@@ -328,12 +432,14 @@ export default function WorldBookRecords({
   const signupFileInputRef = useRef<HTMLInputElement | null>(null);
   const profileFileInputRef = useRef<HTMLInputElement | null>(null);
   const bookCoverFileInputRef = useRef<HTMLInputElement | null>(null);
+  const bookFileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         setAuthModalMode(null);
         setProfileModalOpen(false);
+        setPdfPreviewOpen(false);
         setSelectedBook(null);
         setAuthorsDirectoryOpen(false);
         setSelectedInfoPage(null);
@@ -343,6 +449,52 @@ export default function WorldBookRecords({
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, []);
+
+  useEffect(() => {
+    if (
+      !pdfPreviewOpen ||
+      !selectedBook?.bookFileUrl ||
+      !selectedBook.bookFileUrl.startsWith('data:')
+    ) {
+      return;
+    }
+
+    let revoked = false;
+    let objectUrl: string | null = null;
+    const bookId = selectedBook.id;
+    const sourceUrl = selectedBook.bookFileUrl;
+
+    fetch(sourceUrl)
+      .then((res) => res.blob())
+      .then((blob) => {
+        if (revoked) return;
+        const pdfBlob =
+          blob.type === 'application/pdf'
+            ? blob
+            : new Blob([blob], {type: 'application/pdf'});
+        objectUrl = URL.createObjectURL(pdfBlob);
+        setPdfPreviewBlobUrl({bookId, url: objectUrl});
+      })
+      .catch(() => {
+        if (!revoked) setPdfPreviewBlobUrl({bookId, url: sourceUrl});
+      });
+
+    return () => {
+      revoked = true;
+      if (objectUrl) {
+        URL.revokeObjectURL(objectUrl);
+      }
+    };
+  }, [pdfPreviewOpen, selectedBook]);
+
+  const activePdfUrl =
+    pdfPreviewOpen && selectedBook?.bookFileUrl
+      ? selectedBook.bookFileUrl.startsWith('data:')
+        ? pdfPreviewBlobUrl?.bookId === selectedBook.id
+          ? pdfPreviewBlobUrl.url
+          : null
+        : selectedBook.bookFileUrl
+      : null;
 
   useEffect(() => {
     if (!feedbackBanner) return;
@@ -620,6 +772,59 @@ export default function WorldBookRecords({
       setFormError(
         'Could not process that cover image. Please upload a JPG, PNG, or WebP file.',
       );
+    }
+  };
+
+  const handleBookFilePick = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (isBlockedMediaFile(file)) {
+      e.target.value = '';
+      setFormError(
+        'Images and videos are not allowed here. Please upload a PDF, EPUB, DOCX, TXT, or other document file.',
+      );
+      return;
+    }
+
+    if (file.size > 10 * 1024 * 1024) {
+      e.target.value = '';
+      setFormError('Book file must be 10 MB or smaller.');
+      return;
+    }
+
+    try {
+      const dataUrl = await readFileAsDataUrl(file);
+      setBookFileDraft(dataUrl);
+      setBookFileNameDraft(file.name);
+      setBookFileSizeDraft(formatFileSize(file.size));
+      setFormError(null);
+    } catch {
+      setFormError('Could not read that book file. Please try another file.');
+    }
+  };
+
+  const handleDownloadBookFile = async (book: BookItem) => {
+    if (!book.bookFileUrl) return;
+    const filename = book.bookFileName || `${book.title.replace(/\s+/g, '_')}.pdf`;
+    try {
+      const res = await fetch(book.bookFileUrl);
+      const blob = await res.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 1500);
+    } catch {
+      const link = document.createElement('a');
+      link.href = book.bookFileUrl;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
     }
   };
 
@@ -902,17 +1107,26 @@ export default function WorldBookRecords({
             .insert({
               ...basePayload,
               cover_image_url: bookCoverDraft || null,
+              book_file_url: bookFileDraft || null,
+              book_file_name: bookFileNameDraft || null,
+              book_file_size: bookFileSizeDraft || null,
             })
             .select()
             .single();
 
           if (
             insertError &&
-            insertError.message.toLowerCase().includes('cover_image_url')
+            (insertError.message.toLowerCase().includes('cover_image_url') ||
+              insertError.message.toLowerCase().includes('book_file_'))
           ) {
+            const retryPayload: Record<string, unknown> = {...basePayload};
+            const errLower = insertError.message.toLowerCase();
+            if (!errLower.includes('cover_image_url') && bookCoverDraft) {
+              retryPayload.cover_image_url = bookCoverDraft;
+            }
             const retryRes = await supabaseClient
               .from('books')
-              .insert(basePayload)
+              .insert(retryPayload)
               .select()
               .single();
             insertedBook = retryRes.data;
@@ -936,10 +1150,30 @@ export default function WorldBookRecords({
             }
           }
 
+          if (bookFileDraft && bookFileDraft.length <= 2_500_000) {
+            try {
+              window.localStorage.setItem(
+                `${BOOK_FILE_CACHE_PREFIX}${newId}`,
+                JSON.stringify({
+                  url: bookFileDraft,
+                  name: bookFileNameDraft,
+                  size: bookFileSizeDraft,
+                }),
+              );
+            } catch {
+              // Ignore localStorage quota errors
+            }
+          }
+
           if (insertedBook) {
             const mapped = mapDbBook(insertedBook as DbBookRow);
             if (!mapped.coverImageUrl && bookCoverDraft) {
               mapped.coverImageUrl = bookCoverDraft;
+            }
+            if (!mapped.bookFileUrl && bookFileDraft) {
+              mapped.bookFileUrl = bookFileDraft;
+              mapped.bookFileName = bookFileNameDraft;
+              mapped.bookFileSize = bookFileSizeDraft;
             }
             setBooks((prev) => [mapped, ...prev]);
           }
@@ -976,6 +1210,9 @@ export default function WorldBookRecords({
           setBookDescriptionInput('');
           setBookCoverDraft('');
           setBookCoverMeta('');
+          setBookFileDraft('');
+          setBookFileNameDraft('');
+          setBookFileSizeDraft('');
           setAuthModalMode(null);
           setPassword('');
           scrollToProfile();
@@ -1126,6 +1363,9 @@ export default function WorldBookRecords({
           type: bookAccessInput,
           priceLabel,
           coverImageUrl: bookCoverDraft || undefined,
+          bookFileUrl: bookFileDraft || undefined,
+          bookFileName: bookFileNameDraft || undefined,
+          bookFileSize: bookFileSizeDraft || undefined,
           coverVariant: variant,
           coverKicker: 'WORLD BOOK RECORDS',
           coverFooter: `BY ${currentSession.name.toUpperCase()}`,
@@ -1145,6 +1385,9 @@ export default function WorldBookRecords({
         setBookDescriptionInput('');
         setBookCoverDraft('');
         setBookCoverMeta('');
+        setBookFileDraft('');
+        setBookFileNameDraft('');
+        setBookFileSizeDraft('');
         setAuthModalMode(null);
         setPassword('');
         scrollToProfile();
@@ -1647,10 +1890,17 @@ export default function WorldBookRecords({
                         {book.title}
                       </h3>
                       <div className="text-[12px] text-[#a7a3a0]">by {book.author}</div>
-                      <div className="flex justify-between items-center mt-3 text-[12px]">
-                        <span className="border border-[#4a402d] text-[#d7c18e] rounded-[20px] px-2 py-[3px] text-[10px]">
-                          {book.category}
-                        </span>
+                      <div className="flex justify-between items-center mt-3 text-[12px] gap-1.5">
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className="border border-[#4a402d] text-[#d7c18e] rounded-[20px] px-2 py-[3px] text-[10px]">
+                            {book.category}
+                          </span>
+                          {book.bookFileName && (
+                            <span className="border border-[#383328] bg-[#1b1914] text-[#f2d58b] rounded-[20px] px-2 py-[3px] text-[9px] font-bold tracking-wide">
+                              {getFileExtensionLabel(book.bookFileName)}
+                            </span>
+                          )}
+                        </div>
                         <span className="text-[#d8b35d] font-extrabold tabular-nums">
                           {book.priceLabel}
                         </span>
@@ -2055,6 +2305,9 @@ export default function WorldBookRecords({
                           <div className="flex justify-between items-center mt-2.5 text-[12px]">
                             <span className="text-[#d7c18e] text-[11px]">
                               {book.category}
+                              {book.bookFileName
+                                ? ` · ${getFileExtensionLabel(book.bookFileName)}`
+                                : ''}
                             </span>
                             <span className="text-[#d8b35d] font-extrabold tabular-nums">
                               {book.priceLabel}
@@ -2450,6 +2703,75 @@ export default function WorldBookRecords({
                         </div>
                       )}
                     </div>
+
+                    {/* Book File Upload (PDF or any non-image, non-video file) */}
+                    <div className="bg-[#0d0d10] border border-[#302c25] rounded-[12px] p-3.5">
+                      <div className="flex items-start justify-between gap-3 flex-wrap">
+                        <div className="min-w-0 flex-1">
+                          <div className="text-[12px] font-bold text-[#f7f4ed] mb-0.5 flex items-center gap-1.5">
+                            <FileText className="w-3.5 h-3.5 text-[#d8b35d]" />
+                            <span>Book File (PDF or any document)</span>
+                          </div>
+                          <p className="text-[11px] text-[#a7a3a0] m-0 leading-snug">
+                            Upload PDF, EPUB, DOCX, TXT, ZIP or any file up to 10 MB.
+                            <span className="text-[#d7c18e]">
+                              {' '}
+                              Images &amp; videos are excluded.
+                            </span>
+                          </p>
+                        </div>
+
+                        <input
+                          ref={bookFileInputRef}
+                          type="file"
+                          accept=".pdf,.epub,.doc,.docx,.txt,.rtf,.odt,.mobi,.azw,.azw3,.djvu,.md,.csv,.xls,.xlsx,.ppt,.pptx,.zip,.rar,.7z,application/*,text/*"
+                          onChange={handleBookFilePick}
+                          className="hidden"
+                          aria-label="Upload book file"
+                        />
+
+                        <button
+                          type="button"
+                          onClick={() => bookFileInputRef.current?.click()}
+                          className="inline-flex items-center gap-1.5 border border-[#d8b35d] rounded-[8px] px-3 py-1.5 text-[12px] font-semibold text-[#d8b35d] bg-transparent hover:bg-[#d8b35d]/10 cursor-pointer transition-colors shrink-0"
+                        >
+                          <Upload className="w-3.5 h-3.5" />
+                          <span>{bookFileNameDraft ? 'Change file' : 'Choose file'}</span>
+                        </button>
+                      </div>
+
+                      {bookFileNameDraft && (
+                        <div className="mt-2.5 flex items-center justify-between gap-2 bg-[#141417] border border-[#3d3524] rounded-[8px] px-3 py-2">
+                          <div className="min-w-0 flex items-center gap-2">
+                            <span className="px-1.5 py-0.5 rounded bg-[#d8b35d]/15 border border-[#d8b35d]/40 text-[#f2d58b] text-[10px] font-bold shrink-0">
+                              {getFileExtensionLabel(bookFileNameDraft)}
+                            </span>
+                            <span className="text-[12px] text-[#f7f4ed] truncate">
+                              {bookFileNameDraft}
+                            </span>
+                            {bookFileSizeDraft && (
+                              <span className="text-[11px] text-[#a7a3a0] shrink-0">
+                                ({bookFileSizeDraft})
+                              </span>
+                            )}
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setBookFileDraft('');
+                              setBookFileNameDraft('');
+                              setBookFileSizeDraft('');
+                              if (bookFileInputRef.current) {
+                                bookFileInputRef.current.value = '';
+                              }
+                            }}
+                            className="text-[11px] text-[#a7a3a0] hover:text-white cursor-pointer bg-transparent border-0 p-1 shrink-0"
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      )}
+                    </div>
                   </div>
                 ) : (
                   authModalMode === 'signup' && (
@@ -2507,7 +2829,10 @@ export default function WorldBookRecords({
             exit={{opacity: 0}}
             transition={{duration: 0.16}}
             onClick={(e) => {
-              if (e.target === e.currentTarget) setSelectedBook(null);
+              if (e.target === e.currentTarget) {
+                setPdfPreviewOpen(false);
+                setSelectedBook(null);
+              }
             }}
             className="fixed inset-0 z-30 bg-black/75 grid place-items-center p-[18px]"
             role="dialog"
@@ -2519,11 +2844,14 @@ export default function WorldBookRecords({
               animate={{opacity: 1, scale: 1, y: 0}}
               exit={{opacity: 0, scale: 0.97, y: 8}}
               transition={{duration: 0.16}}
-              className="w-[min(560px,100%)] bg-[#171619] border border-[#66512d] rounded-[16px] p-[25px] relative"
+              className="w-[min(640px,100%)] max-h-[90vh] overflow-y-auto bg-[#171619] border border-[#66512d] rounded-[16px] p-[25px] relative"
             >
               <button
                 type="button"
-                onClick={() => setSelectedBook(null)}
+                onClick={() => {
+                  setPdfPreviewOpen(false);
+                  setSelectedBook(null);
+                }}
                 aria-label="Close book preview"
                 className="absolute right-[15px] top-[12px] bg-transparent border-0 text-[#aaa] hover:text-white cursor-pointer p-1"
               >
@@ -2594,6 +2922,64 @@ export default function WorldBookRecords({
                 </div>
               </div>
 
+              {/* Attached Book File (PDF / Document) */}
+              {selectedBook.bookFileUrl && (
+                <div className="mt-4 bg-[#101013] border border-[#3d3524] rounded-[12px] p-3.5">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <div className="w-9 h-9 rounded-[8px] bg-[#d8b35d]/15 border border-[#d8b35d]/40 grid place-items-center shrink-0">
+                        <FileText className="w-4 h-4 text-[#d8b35d]" />
+                      </div>
+                      <div className="min-w-0">
+                        <div className="text-[12.5px] font-semibold text-[#f7f4ed] truncate">
+                          {selectedBook.bookFileName || 'Attached Book File'}
+                        </div>
+                        <div className="text-[11px] text-[#a7a3a0]">
+                          {getFileExtensionLabel(selectedBook.bookFileName)}
+                          {selectedBook.bookFileSize
+                            ? ` · ${selectedBook.bookFileSize}`
+                            : ''}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2 flex-wrap">
+                      {isPdfBookFile(
+                        selectedBook.bookFileName,
+                        selectedBook.bookFileUrl,
+                      ) && (
+                        <button
+                          type="button"
+                          onClick={() => setPdfPreviewOpen((prev) => !prev)}
+                          className="inline-flex items-center gap-1.5 border border-[#d8b35d] rounded-[8px] px-3 py-1.5 text-[12px] font-bold text-[#d8b35d] bg-transparent hover:bg-[#d8b35d]/10 cursor-pointer transition-colors"
+                        >
+                          <BookOpen className="w-3.5 h-3.5" />
+                          <span>{pdfPreviewOpen ? 'Hide PDF' : 'Read PDF'}</span>
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => handleDownloadBookFile(selectedBook)}
+                        className="inline-flex items-center gap-1.5 border border-[#d8b35d] rounded-[8px] px-3 py-1.5 text-[12px] font-bold text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] cursor-pointer transition-colors"
+                      >
+                        <Download className="w-3.5 h-3.5" />
+                        <span>Download file</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {activePdfUrl && (
+                    <div className="mt-3 rounded-[9px] overflow-hidden border border-[#302c25] bg-[#0b0b0d]">
+                      <iframe
+                        src={activePdfUrl}
+                        title={`${selectedBook.title} PDF preview`}
+                        className="w-full h-[380px] border-0"
+                      />
+                    </div>
+                  )}
+                </div>
+              )}
+
               <div className="mt-4 pt-4 border-t border-[#302c25]">
                 <div className="flex items-center gap-2 text-[11px] text-[#d8b35d] uppercase tracking-[2px] font-bold mb-2">
                   <BookOpen className="w-3.5 h-3.5" />
@@ -2611,8 +2997,13 @@ export default function WorldBookRecords({
                 <button
                   type="button"
                   onClick={() => {
+                    if (selectedBook.bookFileUrl) {
+                      handleDownloadBookFile(selectedBook);
+                      return;
+                    }
                     const bookTitle = selectedBook.title;
                     const isFree = selectedBook.type === 'Free';
+                    setPdfPreviewOpen(false);
                     setSelectedBook(null);
                     setFeedbackBanner(
                       isFree
@@ -2622,7 +3013,11 @@ export default function WorldBookRecords({
                   }}
                   className="border border-[#d8b35d] rounded-[9px] px-4 py-2 text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] font-bold text-[13px] cursor-pointer transition-colors"
                 >
-                  {selectedBook.type === 'Free' ? 'Read for free' : 'Acquire edition'}
+                  {selectedBook.bookFileUrl
+                    ? `Download (${getFileExtensionLabel(selectedBook.bookFileName)})`
+                    : selectedBook.type === 'Free'
+                      ? 'Read for free'
+                      : 'Acquire edition'}
                 </button>
               </div>
             </motion.div>

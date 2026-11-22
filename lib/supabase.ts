@@ -5,6 +5,10 @@ export interface PublicSupabaseConfig {
   publishableKey: string;
 }
 
+export const DEFAULT_SUPABASE_URL = 'https://cwqpnkibptgoqhwkoipx.supabase.co';
+export const DEFAULT_SUPABASE_PUBLISHABLE_KEY =
+  'sb_publishable_ztmMOz8NltN9O9UtSxt6Sg_1-oSnyCt';
+
 export function isValidBrowserSupabaseKey(key?: string | null): key is string {
   return Boolean(key && !key.startsWith('sb_secret_'));
 }
@@ -12,24 +16,23 @@ export function isValidBrowserSupabaseKey(key?: string | null): key is string {
 export function createBrowserSupabaseClient(
   config?: PublicSupabaseConfig | null,
 ): SupabaseClient | null {
-  const url = config?.url || process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const key = config?.publishableKey || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  const envUrl = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim();
+  const envKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY?.trim();
 
-  if (!url || !key) {
-    return null;
-  }
+  const url = config?.url || envUrl || DEFAULT_SUPABASE_URL;
+  const candidateKey =
+    (isValidBrowserSupabaseKey(config?.publishableKey)
+      ? config.publishableKey
+      : '') ||
+    (isValidBrowserSupabaseKey(envKey) ? envKey : '') ||
+    DEFAULT_SUPABASE_PUBLISHABLE_KEY;
 
-  if (key.startsWith('sb_secret_')) {
-    if (typeof window !== 'undefined') {
-      console.warn(
-        'Supabase Config Warning: Secret API key (sb_secret_...) cannot be used in the browser. Use the publishable key (sb_publishable_...) instead.',
-      );
-    }
+  if (!url || !isValidBrowserSupabaseKey(candidateKey)) {
     return null;
   }
 
   try {
-    return createClient(url, key, {
+    return createClient(url, candidateKey, {
       global: {
         fetch: (input, init) => fetch(input, {...init, cache: 'no-store'}),
       },

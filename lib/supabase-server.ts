@@ -10,7 +10,12 @@ import {
   LITERARY_RECORDS,
   MilestoneRecord,
 } from '@/data/library';
-import {isValidBrowserSupabaseKey, PublicSupabaseConfig} from '@/lib/supabase';
+import {
+  DEFAULT_SUPABASE_PUBLISHABLE_KEY,
+  DEFAULT_SUPABASE_URL,
+  isValidBrowserSupabaseKey,
+  PublicSupabaseConfig,
+} from '@/lib/supabase';
 
 interface DbBookRow {
   id: string;
@@ -23,6 +28,9 @@ interface DbBookRow {
   access_type: BookAccessType;
   price_label: string;
   cover_image_url?: string | null;
+  book_file_url?: string | null;
+  book_file_name?: string | null;
+  book_file_size?: string | null;
   cover_variant: BookCoverVariant;
   cover_kicker: string;
   cover_footer: string;
@@ -54,11 +62,11 @@ function cleanEnvValue(value?: string): string {
   return value.trim().replace(/^["']|["']$/g, '');
 }
 
-export function getServerPublicSupabaseConfig(): PublicSupabaseConfig | null {
-  const url = cleanEnvValue(
+export function getServerPublicSupabaseConfig(): PublicSupabaseConfig {
+  const envUrl = cleanEnvValue(
     process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL,
   );
-  const candidateKey = cleanEnvValue(
+  const envKey = cleanEnvValue(
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
       process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY ||
       process.env.NEXT_PUBLIC_SUPABASE_KEY ||
@@ -67,13 +75,11 @@ export function getServerPublicSupabaseConfig(): PublicSupabaseConfig | null {
       process.env.SUPABASE_KEY,
   );
 
-  if (!url || !isValidBrowserSupabaseKey(candidateKey)) {
-    return null;
-  }
-
   return {
-    url,
-    publishableKey: candidateKey,
+    url: envUrl || DEFAULT_SUPABASE_URL,
+    publishableKey: isValidBrowserSupabaseKey(envKey)
+      ? envKey
+      : DEFAULT_SUPABASE_PUBLISHABLE_KEY,
   };
 }
 
@@ -81,18 +87,12 @@ export async function loadInitialLibraryFromServer(): Promise<{
   books: BookItem[];
   authors: AuthorItem[];
   records: MilestoneRecord[];
-  supabaseConfig: PublicSupabaseConfig | null;
+  supabaseConfig: PublicSupabaseConfig;
 }> {
   const supabaseConfig = getServerPublicSupabaseConfig();
   const serverReadKey =
-    supabaseConfig?.publishableKey ||
-    process.env.SUPABASE_SERVICE_ROLE_KEY ||
-    '';
-  const serverUrl =
-    supabaseConfig?.url ||
-    process.env.NEXT_PUBLIC_SUPABASE_URL ||
-    process.env.SUPABASE_URL ||
-    '';
+    supabaseConfig.publishableKey || process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+  const serverUrl = supabaseConfig.url;
 
   if (!serverUrl || !serverReadKey) {
     return {
@@ -134,6 +134,9 @@ export async function loadInitialLibraryFromServer(): Promise<{
           type: row.access_type,
           priceLabel: row.price_label,
           coverImageUrl: row.cover_image_url || undefined,
+          bookFileUrl: row.book_file_url || undefined,
+          bookFileName: row.book_file_name || undefined,
+          bookFileSize: row.book_file_size || undefined,
           coverVariant: row.cover_variant,
           coverKicker: row.cover_kicker,
           coverFooter: row.cover_footer,
