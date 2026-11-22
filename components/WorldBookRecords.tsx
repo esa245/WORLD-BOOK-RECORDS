@@ -1114,11 +1114,13 @@ export default function WorldBookRecords({
             .select()
             .single();
 
+          let strippedOptionalColumn = false;
           if (
             insertError &&
             (insertError.message.toLowerCase().includes('cover_image_url') ||
               insertError.message.toLowerCase().includes('book_file_'))
           ) {
+            strippedOptionalColumn = true;
             const retryPayload: Record<string, unknown> = {...basePayload};
             const errLower = insertError.message.toLowerCase();
             if (!errLower.includes('cover_image_url') && bookCoverDraft) {
@@ -1204,7 +1206,9 @@ export default function WorldBookRecords({
           }
 
           setFeedbackBanner(
-            `"${bookTitleInput.trim()}" has been published to World Book Records.`,
+            strippedOptionalColumn && (bookCoverDraft || bookFileDraft)
+              ? `"${bookTitleInput.trim()}" published, but run the ALTER TABLE SQL in Supabase so everyone can see the attached file.`
+              : `"${bookTitleInput.trim()}" has been published to World Book Records.`,
           );
           setBookTitleInput('');
           setBookDescriptionInput('');
