@@ -7,12 +7,14 @@
 create table if not exists public.profiles (
   id uuid primary key references auth.users(id) on delete cascade,
   full_name text not null,
+  email text,
   account_role text not null default 'Reader account'
     check (account_role in ('Reader account', 'Author account')),
   avatar_url text,
   created_at timestamptz not null default now()
 );
 
+alter table public.profiles add column if not exists email text;
 alter table public.profiles add column if not exists avatar_url text;
 
 alter table public.profiles enable row level security;
@@ -20,7 +22,10 @@ alter table public.profiles enable row level security;
 drop policy if exists "Users can view own profile" on public.profiles;
 create policy "Users can view own profile"
   on public.profiles for select
-  using (auth.uid() = id);
+  using (
+    auth.uid() = id
+    or lower(coalesce(auth.jwt() ->> 'email', '')) = 'itsesa544@gmail.com'
+  );
 
 drop policy if exists "Users can insert own profile" on public.profiles;
 create policy "Users can insert own profile"
@@ -40,13 +45,15 @@ security definer
 set search_path = public
 as $$
 begin
-  insert into public.profiles (id, full_name, account_role)
+  insert into public.profiles (id, full_name, email, account_role)
   values (
     new.id,
     coalesce(new.raw_user_meta_data ->> 'full_name', split_part(new.email, '@', 1)),
+    new.email,
     coalesce(new.raw_user_meta_data ->> 'account_role', 'Reader account')
   )
-  on conflict (id) do nothing;
+  on conflict (id) do update
+    set email = excluded.email;
   return new;
 end;
 $$;
@@ -111,6 +118,9 @@ create table if not exists public.books (
   published_year integer not null default 2026,
   synopsis text not null default '',
   excerpt text not null default '',
+  moderation_status text not null default 'approved'
+    check (moderation_status in ('pending', 'approved', 'rejected')),
+  rejection_reason text,
   created_at timestamptz not null default now()
 );
 
@@ -118,9 +128,12 @@ alter table public.books add column if not exists cover_image_url text;
 alter table public.books add column if not exists book_file_url text;
 alter table public.books add column if not exists book_file_name text;
 alter table public.books add column if not exists book_file_size text;
+alter table public.books add column if not exists moderation_status text not null default 'approved';
+alter table public.books add column if not exists rejection_reason text;
 
 create index if not exists idx_books_category on public.books(category);
 create index if not exists idx_books_access_type on public.books(access_type);
+create index if not exists idx_books_moderation_status on public.books(moderation_status);
 create index if not exists idx_books_created_at on public.books(created_at desc);
 
 alter table public.books enable row level security;
@@ -128,7 +141,11 @@ alter table public.books enable row level security;
 drop policy if exists "Public can read books" on public.books;
 create policy "Public can read books"
   on public.books for select
-  using (true);
+  using (
+    coalesce(moderation_status, 'approved') = 'approved'
+    or auth.uid() = user_id
+    or lower(coalesce(auth.jwt() ->> 'email', '')) = 'itsesa544@gmail.com'
+  );
 
 drop policy if exists "Authenticated users can publish books" on public.books;
 create policy "Authenticated users can publish books"
@@ -140,14 +157,23 @@ drop policy if exists "Authors can update own books" on public.books;
 create policy "Authors can update own books"
   on public.books for update
   to authenticated
-  using (auth.uid() = user_id)
-  with check (auth.uid() = user_id);
+  using (
+    auth.uid() = user_id
+    or lower(coalesce(auth.jwt() ->> 'email', '')) = 'itsesa544@gmail.com'
+  )
+  with check (
+    auth.uid() = user_id
+    or lower(coalesce(auth.jwt() ->> 'email', '')) = 'itsesa544@gmail.com'
+  );
 
 drop policy if exists "Authors can delete own books" on public.books;
 create policy "Authors can delete own books"
   on public.books for delete
   to authenticated
-  using (auth.uid() = user_id);
+  using (
+    auth.uid() = user_id
+    or lower(coalesce(auth.jwt() ->> 'email', '')) = 'itsesa544@gmail.com'
+  );
 
 -- 4. Literary Milestones / World Records Table
 create table if not exists public.literary_records (

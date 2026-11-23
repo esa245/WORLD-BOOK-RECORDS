@@ -195,8 +195,9 @@ export default function PdfCanvasReader({
     if (!el) return;
 
     const updateWidth = () => {
-      const padding = fullPage ? 0 : compact ? 24 : 32;
-      const available = Math.max(280, el.clientWidth - padding);
+      const padding = fullPage ? 0 : compact ? 20 : 24;
+      const minW = fullPage ? el.clientWidth : Math.min(260, el.clientWidth - padding);
+      const available = Math.max(minW, el.clientWidth - padding);
       setContainerWidth(
         fullPage
           ? Math.min(available, 1100)
@@ -271,14 +272,14 @@ export default function PdfCanvasReader({
               type="button"
               onClick={onClose}
               aria-label={`Back from ${title}`}
-              className="fixed top-3 left-3 z-50 inline-flex items-center gap-1.5 rounded-full bg-black/70 hover:bg-black/90 text-[#f7f4ed] border border-white/15 backdrop-blur-md px-3 py-1.5 text-[12px] font-semibold cursor-pointer shadow-lg transition-colors"
+              className="fixed top-3 left-2.5 sm:left-3 z-50 inline-flex items-center gap-1 rounded-full bg-black/75 hover:bg-black/90 text-[#f7f4ed] border border-white/15 backdrop-blur-md px-2.5 py-1.5 text-[11.5px] sm:text-[12px] font-semibold cursor-pointer shadow-lg transition-colors min-h-[36px]"
             >
               <ArrowLeft className="w-3.5 h-3.5 text-[#d8b35d]" />
               <span>Back</span>
             </button>
           )}
 
-          <div className="fixed top-3 right-3 z-50 inline-flex items-center gap-1 rounded-full bg-black/70 text-[#f7f4ed] border border-white/15 backdrop-blur-md px-2 py-1 text-[11px] font-semibold shadow-lg">
+          <div className="fixed top-3 right-2.5 sm:right-3 z-50 inline-flex items-center gap-0.5 sm:gap-1 rounded-full bg-black/75 text-[#f7f4ed] border border-white/15 backdrop-blur-md px-2 py-1 text-[11px] font-semibold shadow-lg min-h-[36px]">
             {numPages > 0 && (
               <span className="px-1.5 tabular-nums text-[#d8b35d]">
                 {currentPage}/{numPages}
@@ -290,7 +291,7 @@ export default function PdfCanvasReader({
                 setZoom((z) => Math.max(0.7, Number((z - 0.15).toFixed(2))))
               }
               aria-label="Zoom out PDF"
-              className="p-1 rounded-full hover:bg-white/10 bg-transparent border-0 text-inherit cursor-pointer"
+              className="p-1.5 rounded-full hover:bg-white/10 bg-transparent border-0 text-inherit cursor-pointer"
             >
               <ZoomOut className="w-3.5 h-3.5" />
             </button>
@@ -308,7 +309,7 @@ export default function PdfCanvasReader({
                 setZoom((z) => Math.min(2, Number((z + 0.15).toFixed(2))))
               }
               aria-label="Zoom in PDF"
-              className="p-1 rounded-full hover:bg-white/10 bg-transparent border-0 text-inherit cursor-pointer"
+              className="p-1.5 rounded-full hover:bg-white/10 bg-transparent border-0 text-inherit cursor-pointer"
             >
               <ZoomIn className="w-3.5 h-3.5" />
             </button>
@@ -318,7 +319,7 @@ export default function PdfCanvasReader({
                 onClick={onDownload}
                 aria-label="Download PDF"
                 title="Download PDF"
-                className="p-1 rounded-full hover:bg-white/10 text-[#d8b35d] bg-transparent border-0 cursor-pointer"
+                className="p-1.5 rounded-full hover:bg-white/10 text-[#d8b35d] bg-transparent border-0 cursor-pointer"
               >
                 <Download className="w-3.5 h-3.5" />
               </button>
@@ -415,7 +416,7 @@ export default function PdfCanvasReader({
             setCurrentPage(approxPage);
           }
         }}
-        className={`flex-1 overflow-y-auto overflow-x-auto ${
+        className={`flex-1 overflow-y-auto overflow-x-auto touch-pan-x touch-pan-y touch-pinch-zoom ${
           fullPage ? 'p-0 space-y-2' : 'p-3 sm:p-5 space-y-5'
         } ${compact ? 'max-h-[430px]' : ''} ${
           fullPage

@@ -1,6 +1,7 @@
 export type BookCategory = 'Fiction' | 'History' | 'Science';
 export type BookAccessType = 'Free' | 'Paid';
 export type BookCoverVariant = 'c1' | 'c2' | 'c3' | 'c4';
+export type BookModerationStatus = 'pending' | 'approved' | 'rejected';
 
 export interface BookItem {
   id: string;
@@ -22,6 +23,8 @@ export interface BookItem {
   publishedYear: number;
   synopsis: string;
   excerpt: string;
+  status?: BookModerationStatus;
+  rejectionReason?: string;
 }
 
 export interface AuthorItem {

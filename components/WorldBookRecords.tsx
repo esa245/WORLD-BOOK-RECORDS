@@ -9,6 +9,8 @@ import {
   BookOpen,
   Camera,
   Check,
+  CheckCircle2,
+  Clock,
   Download,
   FileText,
   ImagePlus,
@@ -18,12 +20,14 @@ import {
   Pencil,
   Plus,
   Search,
+  ShieldCheck,
   Sparkles,
   Sun,
   Trash2,
   Upload,
   User,
   X,
+  XCircle,
 } from 'lucide-react';
 import {
   AUTHORS,
@@ -32,6 +36,7 @@ import {
   BookCategory,
   BookCoverVariant,
   BookItem,
+  BookModerationStatus,
   INFO_PAGES,
   InfoPageItem,
   INITIAL_BOOKS,
@@ -43,6 +48,7 @@ import {
   PublicSupabaseConfig,
 } from '@/lib/supabase';
 import PdfCanvasReader from '@/components/PdfCanvasReader';
+import AdminPanelModal from '@/components/AdminPanelModal';
 import {extractPdfCoverAndMeta} from '@/lib/pdf-client';
 
 type FilterOption = 'All' | BookCategory | BookAccessType;
@@ -201,6 +207,8 @@ interface DbBookRow {
   published_year: number;
   synopsis: string;
   excerpt: string;
+  moderation_status?: BookModerationStatus | null;
+  rejection_reason?: string | null;
 }
 
 interface DbAuthorRow {
@@ -264,6 +272,8 @@ function mapDbBook(row: DbBookRow): BookItem {
     publishedYear: row.published_year,
     synopsis: row.synopsis,
     excerpt: row.excerpt,
+    status: row.moderation_status || 'approved',
+    rejectionReason: row.rejection_reason || undefined,
   };
 }
 
@@ -465,12 +475,86 @@ export default function WorldBookRecords({
   const [formError, setFormError] = useState<string | null>(null);
   const [feedbackBanner, setFeedbackBanner] = useState<string | null>(null);
   const [avatarLoadError, setAvatarLoadError] = useState(false);
+  const [adminPanelOpen, setAdminPanelOpen] = useState(false);
+  const [adminToken, setAdminToken] = useState<string | null>(null);
+  const [moderationMap, setModerationMap] = useState<
+    Record<string, {status: BookModerationStatus; rejectionReason?: string}>
+  >({});
 
   const signupFileInputRef = useRef<HTMLInputElement | null>(null);
   const profileFileInputRef = useRef<HTMLInputElement | null>(null);
   const bookCoverFileInputRef = useRef<HTMLInputElement | null>(null);
   const bookFileInputRef = useRef<HTMLInputElement | null>(null);
   const readerScrollRef = useRef<HTMLDivElement | null>(null);
+
+  const isAdminAccount = Boolean(
+    signedInUser?.email &&
+      signedInUser.email.toLowerCase() === 'itsesa544@gmail.com',
+  );
+
+  const syncUserToModerationStore = async (
+    user: SignedInUser,
+    sbAccessToken?: string,
+  ) => {
+    try {
+      const headers: Record<string, string> = {'Content-Type': 'application/json'};
+      if (sbAccessToken) headers.Authorization = `Bearer ${sbAccessToken}`;
+      await fetch('/api/moderation', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({action: 'sync_user', user}),
+      });
+    } catch {
+      // Ignore transient network errors
+    }
+  };
+
+  const submitBookToModerationStore = async (
+    bookId: string,
+    sbAccessToken?: string,
+  ) => {
+    try {
+      const headers: Record<string, string> = {'Content-Type': 'application/json'};
+      if (adminToken) {
+        headers.Authorization = `Bearer ${adminToken}`;
+      } else if (sbAccessToken) {
+        headers.Authorization = `Bearer ${sbAccessToken}`;
+      }
+      const res = await fetch('/api/moderation', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({action: 'submit_book', bookId}),
+      });
+      if (res.ok) {
+        const data = (await res.json()) as {
+          record?: {status: BookModerationStatus; rejectionReason?: string};
+        };
+        if (data.record) {
+          setModerationMap((prev) => ({...prev, [bookId]: data.record!}));
+        }
+      }
+    } catch {
+      // Keep local fallback status
+    }
+  };
+
+  const refreshModerationStatuses = async () => {
+    try {
+      const res = await fetch('/api/moderation', {cache: 'no-store'});
+      if (!res.ok) return;
+      const data = (await res.json()) as {
+        statuses?: Record<
+          string,
+          {status: BookModerationStatus; rejectionReason?: string}
+        >;
+      };
+      if (data.statuses) {
+        setModerationMap(data.statuses);
+      }
+    } catch {
+      // Ignore offline errors
+    }
+  };
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -482,6 +566,7 @@ export default function WorldBookRecords({
         setReaderBook(null);
         setAuthorsDirectoryOpen(false);
         setSelectedInfoPage(null);
+        setAdminPanelOpen(false);
         setMobileMenuOpen(false);
       }
     };
@@ -624,35 +709,42 @@ export default function WorldBookRecords({
       };
     };
 
-    if (!supabaseClient) {
-      const restoreLocal = async () => {
-        await Promise.resolve();
-        if (!isMounted) return;
-        const savedSession = readLocalJson<SignedInUser | null>(LOCAL_SESSION_KEY, null);
-        if (savedSession) {
-          setSignedInUser(savedSession);
-        }
-        const localBooks = readLocalJson<BookItem[]>(LOCAL_BOOKS_KEY, []);
-        if (localBooks.length > 0) {
-          setBooks((prev) => {
-            const existingIds = new Set(prev.map((b) => b.id));
-            const uniqueLocal = localBooks.filter((b) => !existingIds.has(b.id));
-            return [...uniqueLocal, ...prev];
-          });
-        } else {
-          setBooks((prev) =>
-            prev.map((book) => ({
-              ...book,
-              coverImageUrl: book.coverImageUrl || getCachedBookCover(book.id),
-            })),
-          );
-        }
-      };
-      restoreLocal();
-      return () => {
-        isMounted = false;
-      };
-    }
+      if (typeof window !== 'undefined') {
+        setTimeout(() => {
+          void refreshModerationStatuses();
+        }, 0);
+      }
+
+      if (!supabaseClient) {
+        const restoreLocal = async () => {
+          await Promise.resolve();
+          if (!isMounted) return;
+          const savedSession = readLocalJson<SignedInUser | null>(LOCAL_SESSION_KEY, null);
+          if (savedSession) {
+            setSignedInUser(savedSession);
+            syncUserToModerationStore(savedSession);
+          }
+          const localBooks = readLocalJson<BookItem[]>(LOCAL_BOOKS_KEY, []);
+          if (localBooks.length > 0) {
+            setBooks((prev) => {
+              const existingIds = new Set(prev.map((b) => b.id));
+              const uniqueLocal = localBooks.filter((b) => !existingIds.has(b.id));
+              return [...uniqueLocal, ...prev];
+            });
+          } else {
+            setBooks((prev) =>
+              prev.map((book) => ({
+                ...book,
+                coverImageUrl: book.coverImageUrl || getCachedBookCover(book.id),
+              })),
+            );
+          }
+        };
+        restoreLocal();
+        return () => {
+          isMounted = false;
+        };
+      }
 
     const loadCatalog = async () => {
       try {
@@ -709,6 +801,7 @@ export default function WorldBookRecords({
         if (isMounted) {
           setAvatarLoadError(false);
           setSignedInUser(resolved);
+          syncUserToModerationStore(resolved, data.session?.access_token);
         }
       }
     };
@@ -719,6 +812,7 @@ export default function WorldBookRecords({
     const refreshOnFocus = () => {
       if (document.visibilityState === 'visible') {
         loadCatalog();
+        refreshModerationStatuses();
       }
     };
     window.addEventListener('focus', refreshOnFocus);
@@ -752,6 +846,7 @@ export default function WorldBookRecords({
           if (isMounted) {
             setAvatarLoadError(false);
             setSignedInUser(resolved);
+            syncUserToModerationStore(resolved, session?.access_token);
           }
         } else {
           setSignedInUser(null);
@@ -768,19 +863,56 @@ export default function WorldBookRecords({
     };
   }, [supabaseClient]);
 
+  const booksWithStatus = useMemo(() => {
+    return books.map((book) => {
+      const mod = moderationMap[book.id];
+      const status: BookModerationStatus = mod?.status || book.status || 'approved';
+      const rejectionReason =
+        status === 'rejected'
+          ? mod?.rejectionReason || book.rejectionReason
+          : undefined;
+      return {
+        ...book,
+        status,
+        rejectionReason,
+      };
+    });
+  }, [books, moderationMap]);
+
   const myPublishedBooks = useMemo(() => {
     if (!signedInUser) return [];
     const userNameLower = signedInUser.name.trim().toLowerCase();
-    return books.filter(
+    return booksWithStatus.filter(
       (book) =>
         (book.userId && book.userId === signedInUser.id) ||
         book.author.trim().toLowerCase() === userNameLower,
     );
-  }, [books, signedInUser]);
+  }, [booksWithStatus, signedInUser]);
+
+  const myStatusCounts = useMemo(() => {
+    let approved = 0;
+    let pending = 0;
+    let rejected = 0;
+    for (const book of myPublishedBooks) {
+      if (book.status === 'rejected') rejected += 1;
+      else if (book.status === 'pending') pending += 1;
+      else approved += 1;
+    }
+    return {approved, pending, rejected};
+  }, [myPublishedBooks]);
+
+  const localUsersForAdmin = useMemo(() => {
+    if (!adminPanelOpen || typeof window === 'undefined') return [];
+    return readLocalJson<LocalAccountRecord[]>(LOCAL_USERS_KEY, []);
+  }, [adminPanelOpen]);
 
   const filteredBooks = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
-    return books.filter((book) => {
+    return booksWithStatus.filter((book) => {
+      // Never publish pending or rejected books in the public library
+      if ((book.status || 'approved') !== 'approved') {
+        return false;
+      }
       const searchableText =
         `${book.title} ${book.author} ${book.category} ${book.type} ${book.priceLabel} ${book.coverKicker} ${book.synopsis}`.toLowerCase();
       const matchesQuery = !q || searchableText.includes(q);
@@ -790,7 +922,7 @@ export default function WorldBookRecords({
         book.type === activeFilter;
       return matchesQuery && matchesFilter;
     });
-  }, [books, searchQuery, activeFilter]);
+  }, [booksWithStatus, searchQuery, activeFilter]);
 
   const resetBookForm = () => {
     setEditingBook(null);
@@ -897,6 +1029,88 @@ export default function WorldBookRecords({
     } finally {
       setDeletingBookId(null);
     }
+  };
+
+  const handleModerateBook = async (
+    book: BookItem,
+    status: BookModerationStatus,
+    rejectionReason?: string,
+  ) => {
+    if (!adminToken) {
+      setFeedbackBanner('Please unlock Admin Panel first.');
+      return;
+    }
+
+    const res = await fetch('/api/admin/books', {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${adminToken}`,
+      },
+      body: JSON.stringify({
+        bookId: book.id,
+        status,
+        rejectionReason,
+      }),
+    });
+
+    if (res.status === 401) {
+      setAdminToken(null);
+      setFeedbackBanner('Admin session expired. Please unlock Admin Panel again.');
+      return;
+    }
+
+    const cleanReason =
+      status === 'rejected' && rejectionReason?.trim()
+        ? rejectionReason.trim()
+        : undefined;
+
+    if (supabaseClient) {
+      try {
+        await supabaseClient
+          .from('books')
+          .update({
+            moderation_status: status,
+            rejection_reason: cleanReason || null,
+          })
+          .eq('id', book.id);
+      } catch {
+        // Fallback already stored on /api/admin/books
+      }
+    }
+
+    const existingLocalBooks = readLocalJson<BookItem[]>(LOCAL_BOOKS_KEY, []);
+    if (existingLocalBooks.some((b) => b.id === book.id)) {
+      writeLocalJson(
+        LOCAL_BOOKS_KEY,
+        existingLocalBooks.map((b) =>
+          b.id === book.id ? {...b, status, rejectionReason: cleanReason} : b,
+        ),
+      );
+    }
+
+    setModerationMap((prev) => ({
+      ...prev,
+      [book.id]: {status, rejectionReason: cleanReason},
+    }));
+    setBooks((prev) =>
+      prev.map((b) =>
+        b.id === book.id ? {...b, status, rejectionReason: cleanReason} : b,
+      ),
+    );
+    setSelectedBook((prev) =>
+      prev?.id === book.id
+        ? {...prev, status, rejectionReason: cleanReason}
+        : prev,
+    );
+
+    setFeedbackBanner(
+      status === 'approved'
+        ? `"${book.title}" accepted and published to the public library.`
+        : status === 'rejected'
+          ? `"${book.title}" rejected and hidden from public library.`
+          : `"${book.title}" moved to pending review.`,
+    );
   };
 
   const scrollToProfile = () => {
@@ -1058,6 +1272,8 @@ export default function WorldBookRecords({
       window.localStorage.removeItem(LOCAL_SESSION_KEY);
     }
     setProfileModalOpen(false);
+    setAdminPanelOpen(false);
+    setAdminToken(null);
     setSignedInUser(null);
     setFeedbackBanner('Signed out of your account.');
   };
@@ -1120,14 +1336,16 @@ export default function WorldBookRecords({
             }
           }
 
-          setAvatarLoadError(false);
-          setSignedInUser({
+          const nextUser: SignedInUser = {
             id: user.id,
             name: resolvedName,
             email: user.email,
             role: resolvedRole,
             avatarUrl,
-          });
+          };
+          setAvatarLoadError(false);
+          setSignedInUser(nextUser);
+          syncUserToModerationStore(nextUser, data.session?.access_token);
           setFeedbackBanner(`Welcome back, ${resolvedName}.`);
           setAuthModalMode(null);
           setPassword('');
@@ -1166,27 +1384,45 @@ export default function WorldBookRecords({
             }
 
             if (data.session) {
-              await supabaseClient.from('profiles').upsert({
+              const {error: profErr} = await supabaseClient.from('profiles').upsert({
                 id: data.user.id,
                 full_name: displayName,
+                email: data.user.email || trimmedEmail,
                 account_role: accountType,
                 avatar_url: avatarDraft || null,
               });
+              if (profErr && profErr.message.toLowerCase().includes('email')) {
+                await supabaseClient.from('profiles').upsert({
+                  id: data.user.id,
+                  full_name: displayName,
+                  account_role: accountType,
+                  avatar_url: avatarDraft || null,
+                });
+              }
 
-              setAvatarLoadError(false);
-              setSignedInUser({
+              const nextUser: SignedInUser = {
                 id: data.user.id,
                 name: displayName,
                 email: data.user.email,
                 role: accountType,
                 avatarUrl: avatarDraft || undefined,
-              });
+              };
+              setAvatarLoadError(false);
+              setSignedInUser(nextUser);
+              syncUserToModerationStore(nextUser, data.session.access_token);
               setFeedbackBanner(`Welcome to World Book Records, ${displayName}.`);
               setAuthModalMode(null);
               setPassword('');
               setAvatarDraft('');
               scrollToProfile();
             } else {
+              syncUserToModerationStore({
+                id: data.user.id,
+                name: displayName,
+                email: data.user.email || trimmedEmail,
+                role: accountType,
+                avatarUrl: avatarDraft || undefined,
+              });
               setFeedbackBanner(
                 'Account created. Check your email to confirm before signing in.',
               );
@@ -1268,6 +1504,8 @@ export default function WorldBookRecords({
             Math.max(12, Math.ceil(readingText.split(/\s+/).length / 180) * 12 || 210);
 
           if (editingBook) {
+            const nextStatus: BookModerationStatus =
+              isAdminAccount || adminToken ? 'approved' : 'pending';
             const updateBase = {
               title: bookTitleInput.trim(),
               title_line_1: line1,
@@ -1288,6 +1526,8 @@ export default function WorldBookRecords({
                 book_file_url: bookFileDraft || null,
                 book_file_name: bookFileNameDraft || null,
                 book_file_size: bookFileSizeDraft || null,
+                moderation_status: nextStatus,
+                rejection_reason: null,
               })
               .eq('id', editingBook.id)
               .select()
@@ -1297,13 +1537,22 @@ export default function WorldBookRecords({
             if (
               updateError &&
               (updateError.message.toLowerCase().includes('cover_image_url') ||
-                updateError.message.toLowerCase().includes('book_file_'))
+                updateError.message.toLowerCase().includes('book_file_') ||
+                updateError.message.toLowerCase().includes('moderation_status') ||
+                updateError.message.toLowerCase().includes('rejection_reason'))
             ) {
-              strippedOptionalColumn = true;
+              strippedOptionalColumn =
+                updateError.message.toLowerCase().includes('cover_image_url') ||
+                updateError.message.toLowerCase().includes('book_file_');
               const retryPayload: Record<string, unknown> = {...updateBase};
               const errLower = updateError.message.toLowerCase();
               if (!errLower.includes('cover_image_url')) {
                 retryPayload.cover_image_url = bookCoverDraft || null;
+              }
+              if (!errLower.includes('book_file_')) {
+                retryPayload.book_file_url = bookFileDraft || null;
+                retryPayload.book_file_name = bookFileNameDraft || null;
+                retryPayload.book_file_size = bookFileSizeDraft || null;
               }
               const retryRes = await supabaseClient
                 .from('books')
@@ -1357,7 +1606,15 @@ export default function WorldBookRecords({
               // Ignore localStorage quota errors
             }
 
+            const {data: sessionData} = await supabaseClient.auth.getSession();
+            await submitBookToModerationStore(
+              editingBook.id,
+              sessionData.session?.access_token,
+            );
+
             const mapped = mapDbBook(updatedRow as DbBookRow);
+            mapped.status = nextStatus;
+            mapped.rejectionReason = undefined;
             if (bookCoverDraft && !mapped.coverImageUrl) {
               mapped.coverImageUrl = bookCoverDraft;
             }
@@ -1372,7 +1629,9 @@ export default function WorldBookRecords({
             setFeedbackBanner(
               strippedOptionalColumn
                 ? `Updated "${mapped.title}", but run the ALTER TABLE SQL in Supabase so everyone sees attached files.`
-                : `Updated "${mapped.title}".`,
+                : nextStatus === 'pending'
+                  ? `Updated "${mapped.title}" and sent for Admin review.`
+                  : `Updated "${mapped.title}".`,
             );
             resetBookForm();
             setAuthModalMode(null);
@@ -1383,6 +1642,14 @@ export default function WorldBookRecords({
           }
 
           const newId = `book-${Date.now()}`;
+          const isSubmitterAdmin =
+            trimmedEmail === 'itsesa544@gmail.com' ||
+            isAdminAccount ||
+            Boolean(adminToken);
+          const initialStatus: BookModerationStatus = isSubmitterAdmin
+            ? 'approved'
+            : 'pending';
+
           const basePayload = {
             id: newId,
             user_id: activeUserId,
@@ -1410,6 +1677,8 @@ export default function WorldBookRecords({
               book_file_url: bookFileDraft || null,
               book_file_name: bookFileNameDraft || null,
               book_file_size: bookFileSizeDraft || null,
+              moderation_status: initialStatus,
+              rejection_reason: null,
             })
             .select()
             .single();
@@ -1418,13 +1687,22 @@ export default function WorldBookRecords({
           if (
             insertError &&
             (insertError.message.toLowerCase().includes('cover_image_url') ||
-              insertError.message.toLowerCase().includes('book_file_'))
+              insertError.message.toLowerCase().includes('book_file_') ||
+              insertError.message.toLowerCase().includes('moderation_status') ||
+              insertError.message.toLowerCase().includes('rejection_reason'))
           ) {
-            strippedOptionalColumn = true;
+            strippedOptionalColumn =
+              insertError.message.toLowerCase().includes('cover_image_url') ||
+              insertError.message.toLowerCase().includes('book_file_');
             const retryPayload: Record<string, unknown> = {...basePayload};
             const errLower = insertError.message.toLowerCase();
             if (!errLower.includes('cover_image_url') && bookCoverDraft) {
               retryPayload.cover_image_url = bookCoverDraft;
+            }
+            if (!errLower.includes('book_file_')) {
+              if (bookFileDraft) retryPayload.book_file_url = bookFileDraft;
+              if (bookFileNameDraft) retryPayload.book_file_name = bookFileNameDraft;
+              if (bookFileSizeDraft) retryPayload.book_file_size = bookFileSizeDraft;
             }
             const retryRes = await supabaseClient
               .from('books')
@@ -1467,8 +1745,27 @@ export default function WorldBookRecords({
             }
           }
 
+          const {data: latestSession} = await supabaseClient.auth.getSession();
+          await submitBookToModerationStore(
+            newId,
+            latestSession.session?.access_token,
+          );
+          if (activeUserId) {
+            syncUserToModerationStore(
+              {
+                id: activeUserId,
+                name: displayName,
+                email: trimmedEmail || signedInUser?.email,
+                role: signedInUser?.role || 'Author account',
+              },
+              latestSession.session?.access_token,
+            );
+          }
+
           if (insertedBook) {
             const mapped = mapDbBook(insertedBook as DbBookRow);
+            mapped.status = initialStatus;
+            mapped.rejectionReason = undefined;
             if (!mapped.coverImageUrl && bookCoverDraft) {
               mapped.coverImageUrl = bookCoverDraft;
             }
@@ -1507,8 +1804,10 @@ export default function WorldBookRecords({
 
           setFeedbackBanner(
             strippedOptionalColumn && (bookCoverDraft || bookFileDraft)
-              ? `"${bookTitleInput.trim()}" published, but run the ALTER TABLE SQL in Supabase so everyone can see the attached file.`
-              : `"${bookTitleInput.trim()}" has been published to World Book Records.`,
+              ? `"${bookTitleInput.trim()}" submitted, but run the updated SQL in Supabase for full database sync.`
+              : initialStatus === 'pending'
+                ? `"${bookTitleInput.trim()}" submitted for Admin approval! Track Accepted/Rejected status in your Profile.`
+                : `"${bookTitleInput.trim()}" has been published to World Book Records.`,
           );
           resetBookForm();
           setAuthModalMode(null);
@@ -1658,6 +1957,8 @@ export default function WorldBookRecords({
           Math.max(12, Math.ceil(readingText.split(/\s+/).length / 180) * 12 || 210);
 
         if (editingBook) {
+          const nextStatus: BookModerationStatus =
+            isAdminAccount || adminToken ? 'approved' : 'pending';
           const updatedBook: BookItem = {
             ...editingBook,
             titleLines: [line1, line2],
@@ -1672,6 +1973,8 @@ export default function WorldBookRecords({
             pages: computedPages,
             synopsis: descriptionText,
             excerpt: readingText,
+            status: nextStatus,
+            rejectionReason: undefined,
           };
 
           const existingLocalBooks = readLocalJson<BookItem[]>(LOCAL_BOOKS_KEY, []);
@@ -1686,13 +1989,25 @@ export default function WorldBookRecords({
           setBooks((prev) =>
             prev.map((b) => (b.id === editingBook.id ? updatedBook : b)),
           );
-          setFeedbackBanner(`Updated "${updatedBook.title}".`);
+          await submitBookToModerationStore(editingBook.id);
+          setFeedbackBanner(
+            nextStatus === 'pending'
+              ? `Updated "${updatedBook.title}" and submitted for Admin review.`
+              : `Updated "${updatedBook.title}".`,
+          );
           resetBookForm();
           setAuthModalMode(null);
           setPassword('');
           scrollToProfile();
           return;
         }
+
+        const isSubmitterAdmin =
+          currentSession.email?.toLowerCase() === 'itsesa544@gmail.com' ||
+          Boolean(adminToken);
+        const initialStatus: BookModerationStatus = isSubmitterAdmin
+          ? 'approved'
+          : 'pending';
 
         const newBook: BookItem = {
           id: `book-${Date.now()}`,
@@ -1714,13 +2029,18 @@ export default function WorldBookRecords({
           publishedYear: 2026,
           synopsis: descriptionText,
           excerpt: readingText,
+          status: initialStatus,
         };
 
         const existingLocalBooks = readLocalJson<BookItem[]>(LOCAL_BOOKS_KEY, []);
         writeLocalJson(LOCAL_BOOKS_KEY, [newBook, ...existingLocalBooks]);
         setBooks((prev) => [newBook, ...prev]);
+        await submitBookToModerationStore(newBook.id);
+        syncUserToModerationStore(currentSession);
         setFeedbackBanner(
-          `"${newBook.title}" saved in this browser only. Connect Supabase Secrets so everyone can see it.`,
+          initialStatus === 'pending'
+            ? `"${newBook.title}" submitted for Admin approval! Track Accepted/Rejected status in your Profile.`
+            : `"${newBook.title}" saved in this browser.`,
         );
         resetBookForm();
         setAuthModalMode(null);
@@ -1761,20 +2081,20 @@ export default function WorldBookRecords({
   };
 
   return (
-    <div className="min-h-screen bg-[#0b0b0d] text-[#f7f4ed]">
+    <div className="min-h-screen bg-[#0b0b0d] text-[#f7f4ed] overflow-x-clip">
       {/* Sticky Header */}
       <header className="sticky top-0 z-20 bg-[#0b0b0def] border-b border-[#302c25] backdrop-blur-[14px]">
-        <div className="w-[min(1160px,92%)] mx-auto h-[66px] sm:h-[76px] flex items-center justify-between gap-5">
+        <div className="w-[min(1160px,100%)] mx-auto px-3.5 sm:px-6 h-[62px] sm:h-[76px] flex items-center justify-between gap-2 sm:gap-5">
           <a
             href="#"
-            className="flex items-center gap-[11px] font-extrabold tracking-[0.5px] shrink-0"
+            className="flex items-center gap-2 sm:gap-[11px] font-extrabold tracking-[0.4px] min-w-0"
           >
-            <span className="w-[39px] h-[39px] border border-[#d8b35d] rounded-[12px] grid place-items-center text-[#d8b35d] font-serif text-[22px] shrink-0">
+            <span className="w-[34px] h-[34px] sm:w-[39px] sm:h-[39px] border border-[#d8b35d] rounded-[10px] sm:rounded-[12px] grid place-items-center text-[#d8b35d] font-serif text-[19px] sm:text-[22px] shrink-0">
               W
             </span>
-            <span className="text-[13px] sm:text-[15px] leading-tight whitespace-nowrap">
+            <span className="text-[12px] sm:text-[15px] leading-tight truncate">
               WORLD BOOK RECORDS
-              <small className="block text-[#d8b35d] text-[9px] tracking-[2.2px] font-bold">
+              <small className="block text-[#d8b35d] text-[8px] sm:text-[9px] tracking-[1.3px] sm:tracking-[2.2px] font-bold truncate">
                 READ · WRITE · MAKE HISTORY
               </small>
             </span>
@@ -1808,17 +2128,39 @@ export default function WorldBookRecords({
             >
               Publish
             </a>
+            <button
+              type="button"
+              onClick={() => setAdminPanelOpen(true)}
+              className="inline-flex items-center gap-1 hover:text-[#d8b35d] transition-colors whitespace-nowrap bg-transparent border-0 p-0 text-inherit cursor-pointer"
+            >
+              <ShieldCheck className="w-3.5 h-3.5 text-[#d8b35d]" />
+              <span>Admin</span>
+            </button>
           </nav>
 
-          <div className="flex items-center gap-[10px] shrink-0">
+          <div className="flex items-center gap-1.5 sm:gap-[10px] shrink-0">
+            <button
+              type="button"
+              onClick={() => setAdminPanelOpen(true)}
+              aria-label="Open Admin Panel"
+              title="Admin Panel"
+              className={`min-[851px]:hidden inline-flex items-center justify-center rounded-[8px] border w-[36px] h-[36px] cursor-pointer transition-colors shrink-0 ${
+                isAdminAccount || adminToken
+                  ? 'border-[#d8b35d] bg-[#382d18] text-[#f2d58b]'
+                  : 'border-[#302c25] bg-transparent text-[#d2cec5] hover:border-[#d8b35d]'
+              }`}
+            >
+              <ShieldCheck className="w-4 h-4" />
+            </button>
             {signedInUser ? (
-              <div className="flex items-center gap-2.5">
+              <div className="flex items-center gap-1.5 sm:gap-2.5">
                 <button
                   type="button"
                   onClick={() => setProfileModalOpen(true)}
-                  className="flex items-center gap-2 rounded-[9px] px-2 py-1 bg-transparent border-0 hover:bg-[#1b1a1c] transition-colors cursor-pointer"
+                  className="flex items-center gap-2 rounded-[9px] px-1.5 py-1 bg-transparent border-0 hover:bg-[#1b1a1c] transition-colors cursor-pointer min-h-[40px]"
+                  aria-label="Open my profile"
                 >
-                  <span className="w-7 h-7 rounded-full border border-[#d8b35d] overflow-hidden grid place-items-center bg-[#242018] text-[#ffe6a8] font-serif text-[12px] shrink-0">
+                  <span className="w-8 h-8 sm:w-7 sm:h-7 rounded-full border border-[#d8b35d] overflow-hidden grid place-items-center bg-[#242018] text-[#ffe6a8] font-serif text-[12px] shrink-0">
                     {signedInUser.avatarUrl && !avatarLoadError ? (
                       <img
                         src={signedInUser.avatarUrl}
@@ -1848,14 +2190,14 @@ export default function WorldBookRecords({
                 <button
                   type="button"
                   onClick={() => openAuthModal('login')}
-                  className="hidden min-[541px]:inline-flex border border-[#d8b35d] rounded-[9px] px-4 py-2.5 text-[#d8b35d] bg-transparent hover:bg-[#d8b35d]/10 font-bold text-[14px] cursor-pointer transition-colors whitespace-nowrap"
+                  className="hidden min-[541px]:inline-flex border border-[#d8b35d] rounded-[9px] px-4 py-2 text-[#d8b35d] bg-transparent hover:bg-[#d8b35d]/10 font-bold text-[13.5px] cursor-pointer transition-colors whitespace-nowrap"
                 >
                   Log in
                 </button>
                 <button
                   type="button"
                   onClick={() => openAuthModal('signup')}
-                  className="border border-[#d8b35d] rounded-[9px] px-4 py-2.5 text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] font-bold text-[14px] cursor-pointer transition-colors whitespace-nowrap"
+                  className="border border-[#d8b35d] rounded-[9px] px-2.5 sm:px-4 py-2 text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] font-bold text-[12px] sm:text-[13.5px] cursor-pointer transition-colors whitespace-nowrap min-h-[38px]"
                 >
                   Join free
                 </button>
@@ -1866,7 +2208,7 @@ export default function WorldBookRecords({
               type="button"
               aria-label="Toggle navigation menu"
               onClick={() => setMobileMenuOpen((prev) => !prev)}
-              className="min-[851px]:hidden bg-transparent border border-[#302c25] text-white p-2 rounded-[8px] cursor-pointer hover:border-[#d8b35d] transition-colors"
+              className="min-[851px]:hidden bg-transparent border border-[#302c25] text-white w-[38px] h-[38px] grid place-items-center rounded-[8px] cursor-pointer hover:border-[#d8b35d] transition-colors shrink-0"
             >
               {mobileMenuOpen ? <X className="w-4 h-4" /> : <Menu className="w-4 h-4" />}
             </button>
@@ -1924,6 +2266,17 @@ export default function WorldBookRecords({
                 >
                   Publish
                 </a>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMobileMenuOpen(false);
+                    setAdminPanelOpen(true);
+                  }}
+                  className="py-1.5 text-[#d8b35d] font-semibold text-left bg-transparent border-0 p-0 cursor-pointer inline-flex items-center gap-1.5"
+                >
+                  <ShieldCheck className="w-4 h-4" />
+                  <span>Admin Panel</span>
+                </button>
                 {signedInUser ? (
                   <button
                     type="button"
@@ -1957,7 +2310,7 @@ export default function WorldBookRecords({
             initial={{opacity: 0, y: -12}}
             animate={{opacity: 1, y: 0}}
             exit={{opacity: 0, y: -12}}
-            className="fixed top-20 right-4 z-40 max-w-sm bg-[#1c1a16] border border-[#65502b] rounded-[12px] px-4 py-3 shadow-[0_12px_30px_rgba(0,0,0,0.65)] flex items-start gap-3"
+            className="fixed top-[70px] sm:top-20 left-3.5 right-3.5 sm:left-auto sm:right-4 z-40 sm:max-w-sm bg-[#1c1a16] border border-[#65502b] rounded-[12px] px-4 py-3 shadow-[0_12px_30px_rgba(0,0,0,0.65)] flex items-start gap-3"
           >
             <Check className="w-4 h-4 text-[#d8b35d] shrink-0 mt-0.5" />
             <p className="text-[13px] text-[#f7f4ed] m-0 flex-1">{feedbackBanner}</p>
@@ -1965,7 +2318,7 @@ export default function WorldBookRecords({
               type="button"
               onClick={() => setFeedbackBanner(null)}
               aria-label="Dismiss notification"
-              className="text-[#a7a3a0] hover:text-white cursor-pointer"
+              className="text-[#a7a3a0] hover:text-white cursor-pointer p-1 -m-1"
             >
               <X className="w-4 h-4" />
             </button>
@@ -1977,121 +2330,127 @@ export default function WorldBookRecords({
 
         {/* Hero Section */}
         <section
-          className="py-[52px] sm:py-[76px] pb-[35px] sm:pb-[58px] overflow-hidden"
+          className="pt-9 pb-10 sm:py-[72px] sm:pb-[58px] overflow-hidden"
           style={{
             background:
               'radial-gradient(ellipse at 75% 30%, #49371955, transparent 42%), linear-gradient(180deg, #12100d 0%, #0b0b0d 100%)',
           }}
         >
-          <div className="w-[min(1160px,92%)] mx-auto grid grid-cols-1 min-[851px]:grid-cols-[1.15fr_0.85fr] gap-[10px] min-[851px]:gap-[55px] items-center">
+          <div className="w-[min(1160px,100%)] mx-auto px-4 sm:px-6 grid grid-cols-1 min-[851px]:grid-cols-[1.15fr_0.85fr] gap-6 min-[851px]:gap-[55px] items-center">
             <div>
-              <div className="text-[#d8b35d] text-[11px] font-extrabold tracking-[3px] uppercase">
+              <div className="text-[#d8b35d] text-[10.5px] sm:text-[11px] font-extrabold tracking-[2.4px] sm:tracking-[3px] uppercase">
                 A home for extraordinary stories
               </div>
-              <h1 className="font-serif text-[46px] sm:text-[clamp(42px,6vw,72px)] leading-[1.02] mt-[18px] mb-[20px] tracking-[-1.5px] font-normal text-[#f7f4ed]">
+              <h1 className="font-serif text-[clamp(36px,9.5vw,72px)] leading-[1.03] mt-3.5 sm:mt-[18px] mb-4 sm:mb-[20px] tracking-[-1px] sm:tracking-[-1.5px] font-normal text-[#f7f4ed] text-balance">
                 Every book
                 <br />
                 makes <em className="text-[#d8b35d] not-italic">history.</em>
               </h1>
-              <p className="max-w-[580px] text-[#b9b3a8] text-[17px] leading-[1.55]">
+              <p className="max-w-[580px] text-[#b9b3a8] text-[15px] sm:text-[17px] leading-[1.58] m-0">
                 Discover remarkable books, meet the minds behind them, and give your
                 words a place in the world. A global home for authors and readers.
               </p>
 
-              <div className="flex gap-3 mt-[28px] flex-wrap">
+              <div className="grid grid-cols-1 min-[390px]:grid-cols-2 sm:flex gap-2.5 sm:gap-3 mt-6 sm:mt-[28px]">
                 <a
                   href="#books"
-                  className="inline-flex items-center gap-1.5 border border-[#d8b35d] rounded-[9px] px-4 py-2.5 text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] font-bold text-[15px] transition-colors whitespace-nowrap"
+                  className="inline-flex items-center justify-center gap-1.5 border border-[#d8b35d] rounded-[9px] px-4 py-3 sm:py-2.5 text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] font-bold text-[14px] sm:text-[15px] transition-colors whitespace-nowrap min-h-[44px]"
                 >
                   Explore the library
-                  <ArrowUpRight className="w-4 h-4" />
+                  <ArrowUpRight className="w-4 h-4 shrink-0" />
                 </a>
                 <button
                   type="button"
                   onClick={() =>
                     signedInUser ? setProfileModalOpen(true) : openAuthModal('publish')
                   }
-                  className="border border-[#d8b35d] rounded-[9px] px-4 py-2.5 text-[#d8b35d] bg-transparent hover:bg-[#d8b35d]/10 font-bold text-[15px] cursor-pointer transition-colors whitespace-nowrap"
+                  className="inline-flex items-center justify-center border border-[#d8b35d] rounded-[9px] px-4 py-3 sm:py-2.5 text-[#d8b35d] bg-transparent hover:bg-[#d8b35d]/10 font-bold text-[14px] sm:text-[15px] cursor-pointer transition-colors whitespace-nowrap min-h-[44px]"
                 >
                   Publish your book
                 </button>
               </div>
 
-              <div className="flex gap-[20px] sm:gap-[34px] mt-[42px] flex-wrap">
+              <div className="grid grid-cols-3 gap-3 sm:flex sm:gap-[34px] mt-8 sm:mt-[42px]">
                 <div>
-                  <strong className="block font-serif text-[23px] sm:text-[28px] text-[#d8b35d] font-normal">
+                  <strong className="block font-serif text-[18px] sm:text-[28px] text-[#d8b35d] font-normal leading-tight">
                     Global
                   </strong>
-                  <span className="text-[#a7a3a0] text-[12px]">Author community</span>
+                  <span className="text-[#a7a3a0] text-[11px] sm:text-[12px] leading-snug block mt-0.5">
+                    Author community
+                  </span>
                 </div>
                 <div>
-                  <strong className="block font-serif text-[23px] sm:text-[28px] text-[#d8b35d] font-normal">
+                  <strong className="block font-serif text-[18px] sm:text-[28px] text-[#d8b35d] font-normal leading-tight">
                     Free + Paid
                   </strong>
-                  <span className="text-[#a7a3a0] text-[12px]">Open reading library</span>
+                  <span className="text-[#a7a3a0] text-[11px] sm:text-[12px] leading-snug block mt-0.5">
+                    Open reading library
+                  </span>
                 </div>
                 <div>
-                  <strong className="block font-serif text-[23px] sm:text-[28px] text-[#d8b35d] font-normal">
+                  <strong className="block font-serif text-[18px] sm:text-[28px] text-[#d8b35d] font-normal leading-tight">
                     One world
                   </strong>
-                  <span className="text-[#a7a3a0] text-[12px]">Many stories</span>
+                  <span className="text-[#a7a3a0] text-[11px] sm:text-[12px] leading-snug block mt-0.5">
+                    Many stories
+                  </span>
                 </div>
               </div>
             </div>
 
             {/* 3D Tilted Dual-Book Stage */}
-            <div className="h-[300px] sm:h-[330px] min-[851px]:h-[390px] relative grid place-items-center mt-6 min-[851px]:mt-0">
-              <div className="absolute w-[310px] h-[310px] rounded-full bg-[#c99b3c20] blur-[30px] pointer-events-none" />
+            <div className="w-full max-w-[330px] sm:max-w-[440px] mx-auto h-[270px] sm:h-[330px] min-[851px]:h-[390px] relative grid place-items-center mt-4 min-[851px]:mt-0">
+              <div className="absolute w-[240px] sm:w-[310px] h-[240px] sm:h-[310px] rounded-full bg-[#c99b3c20] blur-[30px] pointer-events-none" />
 
               {/* Back Book */}
               <div
-                className="absolute w-[165px] h-[235px] sm:w-[205px] sm:h-[286px] rounded-[5px_14px_14px_5px] shadow-[18px_22px_35px_rgba(0,0,0,0.6)] flex flex-col justify-between px-[19px] py-[23px] border border-[#8bb0a577] translate-x-[82px] translate-y-[18px] sm:translate-x-[110px] sm:translate-y-[22px] rotate-[10deg]"
+                className="absolute w-[142px] h-[204px] sm:w-[205px] sm:h-[286px] rounded-[5px_14px_14px_5px] shadow-[18px_22px_35px_rgba(0,0,0,0.6)] flex flex-col justify-between px-[16px] py-[19px] sm:px-[19px] sm:py-[23px] border border-[#8bb0a577] translate-x-[50px] translate-y-[14px] sm:translate-x-[110px] sm:translate-y-[22px] rotate-[10deg]"
                 style={{
                   background: 'linear-gradient(145deg, #172c31, #101519)',
                 }}
               >
                 <span className="absolute left-[8px] top-0 bottom-0 w-[2px] bg-[#e5c16b66]" />
-                <div className="text-[9px] tracking-[2px] text-[#b8d3ca]">
+                <div className="text-[7.5px] sm:text-[9px] tracking-[1.5px] sm:tracking-[2px] text-[#b8d3ca]">
                   WORLD BOOK RECORDS
                 </div>
-                <div className="font-serif text-[24px] sm:text-[30px] leading-[1.05] text-[#f4e6c5]">
+                <div className="font-serif text-[20px] sm:text-[30px] leading-[1.05] text-[#f4e6c5]">
                   Beyond
                   <br />
                   the Blue
                 </div>
-                <div className="text-[9px] tracking-[2px] text-[#b8d3ca]">
+                <div className="text-[7.5px] sm:text-[9px] tracking-[1.5px] sm:tracking-[2px] text-[#b8d3ca]">
                   A WORLD OF IDEAS
                 </div>
               </div>
 
               {/* Front Book */}
               <div
-                className="absolute w-[165px] h-[235px] sm:w-[205px] sm:h-[286px] rounded-[5px_14px_14px_5px] shadow-[18px_22px_35px_rgba(0,0,0,0.6)] flex flex-col justify-between px-[19px] py-[23px] border border-[#f0d58a77] -rotate-[8deg]"
+                className="absolute w-[142px] h-[204px] sm:w-[205px] sm:h-[286px] rounded-[5px_14px_14px_5px] shadow-[18px_22px_35px_rgba(0,0,0,0.6)] flex flex-col justify-between px-[16px] py-[19px] sm:px-[19px] sm:py-[23px] border border-[#f0d58a77] -translate-x-[24px] sm:translate-x-0 -rotate-[8deg]"
                 style={{
                   background: 'linear-gradient(145deg, #3b2816, #111)',
                 }}
               >
                 <span className="absolute left-[8px] top-0 bottom-0 w-[2px] bg-[#e5c16b66]" />
-                <div className="text-[9px] tracking-[2px] text-[#f2d58b]">
+                <div className="text-[7.5px] sm:text-[9px] tracking-[1.5px] sm:tracking-[2px] text-[#f2d58b]">
                   THE GLOBAL LIBRARY
                 </div>
-                <div className="font-serif text-[24px] sm:text-[30px] leading-[1.05] text-[#f4e6c5]">
+                <div className="font-serif text-[20px] sm:text-[30px] leading-[1.05] text-[#f4e6c5]">
                   Words
                   <br />
                   That Last
                 </div>
-                <div className="text-[9px] tracking-[2px] text-[#c9ad6d]">
+                <div className="text-[7.5px] sm:text-[9px] tracking-[1.5px] sm:tracking-[2px] text-[#c9ad6d]">
                   AUTHOR EDITION · 2026
                 </div>
               </div>
 
-              {/* Floating Badges */}
-              <div className="absolute right-0 sm:-right-[5px] top-[40px] bg-[#1c1a16] border border-[#65502b] rounded-[12px] p-[9px] sm:px-[15px] sm:py-[12px] text-[10px] sm:text-[12px] shadow-[0_12px_30px_rgba(0,0,0,0.53)]">
+              {/* Floating Callout Cards */}
+              <div className="absolute right-0 sm:-right-[5px] top-[16px] sm:top-[40px] bg-[#1c1a16]/95 border border-[#65502b] rounded-[11px] px-2.5 py-2 sm:px-[15px] sm:py-[12px] text-[10px] sm:text-[12px] shadow-[0_12px_30px_rgba(0,0,0,0.53)]">
                 ✦ <b className="text-[#d8b35d]">Author spotlight</b>
                 <br />
                 Stories worth discovering
               </div>
-              <div className="absolute left-0 bottom-[35px] bg-[#1c1a16] border border-[#65502b] rounded-[12px] p-[9px] sm:px-[15px] sm:py-[12px] text-[10px] sm:text-[12px] shadow-[0_12px_30px_rgba(0,0,0,0.53)]">
+              <div className="absolute left-0 bottom-[14px] sm:bottom-[35px] bg-[#1c1a16]/95 border border-[#65502b] rounded-[11px] px-2.5 py-2 sm:px-[15px] sm:py-[12px] text-[10px] sm:text-[12px] shadow-[0_12px_30px_rgba(0,0,0,0.53)]">
                 ◈ <b className="text-[#d8b35d]">World Records</b>
                 <br />
                 Celebrate literary milestones
@@ -2101,18 +2460,18 @@ export default function WorldBookRecords({
         </section>
 
         {/* Books Library Section */}
-        <section id="books" className="py-[68px]">
-          <div className="w-[min(1160px,92%)] mx-auto">
-            <div className="flex flex-col sm:flex-row items-start sm:items-end justify-between gap-5 mb-[27px]">
+        <section id="books" className="py-12 sm:py-[68px]">
+          <div className="w-[min(1160px,100%)] mx-auto px-4 sm:px-6">
+            <div className="flex flex-col sm:flex-row items-start sm:items-end justify-between gap-3 sm:gap-5 mb-5 sm:mb-[27px]">
               <div>
-                <div className="text-[#d8b35d] text-[11px] font-extrabold tracking-[3px] uppercase">
+                <div className="text-[#d8b35d] text-[10.5px] sm:text-[11px] font-extrabold tracking-[2.6px] sm:tracking-[3px] uppercase">
                   The library
                 </div>
-                <h2 className="font-serif text-[30px] sm:text-[36px] mt-[7px] mb-0 font-normal">
+                <h2 className="font-serif text-[27px] sm:text-[36px] mt-[6px] mb-0 font-normal leading-tight">
                   Books to get lost in
                 </h2>
               </div>
-              <p className="text-[#a7a3a0] m-0 max-w-[420px]">
+              <p className="text-[#a7a3a0] m-0 max-w-[420px] text-[14px] sm:text-[15px]">
                 Explore fresh voices, timeless ideas and stories from authors around the
                 world.
               </p>
@@ -2121,7 +2480,7 @@ export default function WorldBookRecords({
             {/* Search Bar */}
             <form
               onSubmit={(e) => e.preventDefault()}
-              className="flex flex-col min-[541px]:flex-row gap-[10px] mt-[22px] mb-[28px]"
+              className="flex flex-col min-[541px]:flex-row gap-2.5 mt-4 sm:mt-[22px] mb-5 sm:mb-[28px]"
             >
               <div className="relative flex-1 min-w-0">
                 <input
@@ -2130,20 +2489,20 @@ export default function WorldBookRecords({
                   onChange={(e) => setSearchQuery(e.target.value)}
                   placeholder="Search books, authors or topics…"
                   aria-label="Search books, authors or topics"
-                  className="w-full bg-[#141417] border border-[#302c25] focus:border-[#d8b35d] rounded-[9px] px-4 py-[14px] text-white outline-none transition-colors"
+                  className="w-full bg-[#141417] border border-[#302c25] focus:border-[#d8b35d] rounded-[9px] px-4 py-3 sm:py-[14px] text-[16px] sm:text-[15px] text-white outline-none transition-colors"
                 />
               </div>
               <button
                 type="submit"
-                className="border border-[#d8b35d] rounded-[9px] px-5 py-[14px] text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] font-bold cursor-pointer transition-colors whitespace-nowrap inline-flex items-center justify-center gap-2"
+                className="border border-[#d8b35d] rounded-[9px] px-5 py-3 sm:py-[14px] text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] font-bold text-[14px] sm:text-[15px] cursor-pointer transition-colors whitespace-nowrap inline-flex items-center justify-center gap-2 min-h-[44px]"
               >
                 <Search className="w-4 h-4" />
                 <span>Search</span>
               </button>
             </form>
 
-            {/* Filter Pills */}
-            <div className="flex gap-2 flex-wrap mb-[22px]">
+            {/* Filter Bar (Horizontal single row on mobile, wrap on desktop) */}
+            <div className="flex gap-2 overflow-x-auto no-scrollbar sm:flex-wrap pb-1 mb-5 sm:mb-[22px]">
               {FILTER_OPTIONS.map((filter) => {
                 const isActive = activeFilter === filter.value;
                 return (
@@ -2151,7 +2510,7 @@ export default function WorldBookRecords({
                     key={filter.value}
                     type="button"
                     onClick={() => setActiveFilter(filter.value)}
-                    className={`rounded-[30px] px-[15px] py-2 text-[12px] cursor-pointer transition-colors border ${
+                    className={`rounded-[9px] px-3.5 py-2 text-[12.5px] font-medium cursor-pointer transition-colors border shrink-0 whitespace-nowrap min-h-[38px] ${
                       isActive
                         ? 'bg-[#382d18] border-[#d8b35d] text-[#f2d58b]'
                         : 'bg-[#141417] border-[#302c25] text-[#c8c2b6] hover:bg-[#382d18] hover:border-[#d8b35d] hover:text-[#f2d58b]'
@@ -2165,7 +2524,7 @@ export default function WorldBookRecords({
 
             {/* Book Grid */}
             {filteredBooks.length > 0 ? (
-              <div className="grid grid-cols-2 min-[851px]:grid-cols-4 gap-[10px] sm:gap-[18px]">
+              <div className="grid grid-cols-2 min-[851px]:grid-cols-4 gap-3 sm:gap-[18px]">
                 {filteredBooks.map((book) => (
                   <article
                     key={book.id}
@@ -2179,13 +2538,13 @@ export default function WorldBookRecords({
                     tabIndex={0}
                     role="button"
                     aria-label={`Read preview of ${book.title} by ${book.author}`}
-                    className="bg-[#141417] border border-[#292621] rounded-[13px] p-[13px] transition duration-200 hover:-translate-y-1 hover:border-[#806633] cursor-pointer focus-visible:outline-2 focus-visible:outline-[#d8b35d]"
+                    className="bg-[#141417] border border-[#292621] rounded-[13px] p-2.5 sm:p-[13px] transition duration-200 hover:-translate-y-1 hover:border-[#806633] cursor-pointer focus-visible:outline-2 focus-visible:outline-[#d8b35d] flex flex-col"
                   >
                     <div
-                      className={`h-[165px] sm:h-[205px] rounded-[7px] flex flex-col justify-between shadow-[inset_5px_0_rgba(255,255,255,0.08)] relative overflow-hidden ${COVER_GRADIENTS[book.coverVariant]} ${
+                      className={`aspect-[2/3] w-full rounded-[7px] flex flex-col justify-between shadow-[inset_5px_0_rgba(255,255,255,0.08)] relative overflow-hidden ${COVER_GRADIENTS[book.coverVariant]} ${
                         book.coverImageUrl && !bookCoverErrors[book.id]
                           ? ''
-                          : 'p-[13px] sm:p-[17px]'
+                          : 'p-3 sm:p-[17px]'
                       }`}
                     >
                       {book.coverImageUrl && !bookCoverErrors[book.id] ? (
@@ -2208,40 +2567,40 @@ export default function WorldBookRecords({
                         <>
                           <span
                             aria-hidden="true"
-                            className="absolute w-[160px] h-[160px] border border-white/15 rounded-full -right-[60px] -bottom-[55px] pointer-events-none"
+                            className="absolute w-[140px] sm:w-[160px] h-[140px] sm:h-[160px] border border-white/15 rounded-full -right-[55px] -bottom-[50px] pointer-events-none"
                           />
-                          <small className="text-[9px] tracking-[2px] opacity-80">
+                          <small className="text-[7.5px] sm:text-[9px] tracking-[1.5px] sm:tracking-[2px] opacity-80 truncate">
                             {book.coverKicker}
                           </small>
-                          <strong className="font-serif text-[21px] sm:text-[26px] leading-[1.08] max-w-[150px] font-normal">
+                          <strong className="font-serif text-[17px] sm:text-[25px] leading-[1.08] max-w-full font-normal break-words">
                             {book.titleLines[0]}
                             <br />
                             {book.titleLines[1]}
                           </strong>
-                          <span className="text-[9px] tracking-[1.5px]">
+                          <span className="text-[7.5px] sm:text-[9px] tracking-[1.2px] sm:tracking-[1.5px] truncate">
                             {book.coverFooter}
                           </span>
                         </>
                       )}
                     </div>
 
-                    <div className="pt-[12px] px-[2px] pb-[3px]">
-                      <h3 className="font-serif text-[16px] sm:text-[18px] m-0 mb-1 font-normal">
-                        {book.title}
-                      </h3>
-                      <div className="text-[12px] text-[#a7a3a0]">by {book.author}</div>
-                      <div className="flex justify-between items-center mt-3 text-[12px] gap-1.5">
-                        <div className="flex items-center gap-1.5 flex-wrap">
-                          <span className="border border-[#4a402d] text-[#d7c18e] rounded-[20px] px-2 py-[3px] text-[10px]">
-                            {book.category}
-                          </span>
-                          {book.bookFileName && (
-                            <span className="border border-[#383328] bg-[#1b1914] text-[#f2d58b] rounded-[20px] px-2 py-[3px] text-[9px] font-bold tracking-wide">
-                              {getFileExtensionLabel(book.bookFileName)}
-                            </span>
-                          )}
+                    <div className="pt-2.5 sm:pt-[12px] px-[2px] pb-[2px] flex-1 flex flex-col justify-between">
+                      <div>
+                        <h3 className="font-serif text-[14.5px] sm:text-[18px] m-0 mb-0.5 font-normal leading-snug line-clamp-2">
+                          {book.title}
+                        </h3>
+                        <div className="text-[11.5px] sm:text-[12px] text-[#a7a3a0] truncate">
+                          by {book.author}
                         </div>
-                        <span className="text-[#d8b35d] font-extrabold tabular-nums">
+                      </div>
+                      <div className="flex justify-between items-center mt-2.5 text-[11px] sm:text-[12px] gap-1.5 pt-2 border-t border-[#221f1a]">
+                        <span className="text-[#c8c2b6] truncate">
+                          {book.category}
+                          {book.bookFileName
+                            ? ` · ${getFileExtensionLabel(book.bookFileName)}`
+                            : ''}
+                        </span>
+                        <span className="text-[#d8b35d] font-extrabold tabular-nums shrink-0">
                           {book.priceLabel}
                         </span>
                       </div>
@@ -2268,28 +2627,28 @@ export default function WorldBookRecords({
         </section>
 
         {/* Authors Spotlight Section */}
-        <section id="authors" className="py-[68px] bg-[#101012]">
-          <div className="w-[min(1160px,92%)] mx-auto">
-            <div className="flex flex-col sm:flex-row items-start sm:items-end justify-between gap-5 mb-[27px]">
+        <section id="authors" className="py-12 sm:py-[68px] bg-[#101012]">
+          <div className="w-[min(1160px,100%)] mx-auto px-4 sm:px-6">
+            <div className="flex flex-col sm:flex-row items-start sm:items-end justify-between gap-3 sm:gap-5 mb-5 sm:mb-[27px]">
               <div>
-                <div className="text-[#d8b35d] text-[11px] font-extrabold tracking-[3px] uppercase">
+                <div className="text-[#d8b35d] text-[10.5px] sm:text-[11px] font-extrabold tracking-[2.6px] sm:tracking-[3px] uppercase">
                   Meet the minds
                 </div>
-                <h2 className="font-serif text-[30px] sm:text-[36px] mt-[7px] mb-0 font-normal">
+                <h2 className="font-serif text-[27px] sm:text-[36px] mt-[6px] mb-0 font-normal leading-tight">
                   Authors in the spotlight
                 </h2>
               </div>
               <button
                 type="button"
                 onClick={() => setAuthorsDirectoryOpen(true)}
-                className="text-[#d8b35d] text-[13px] inline-flex items-center gap-1.5 hover:text-[#f2d58b] transition-colors cursor-pointer bg-transparent border-0 p-0"
+                className="text-[#d8b35d] text-[13px] inline-flex items-center gap-1.5 hover:text-[#f2d58b] transition-colors cursor-pointer bg-transparent border-0 p-0 min-h-[36px]"
               >
                 <span>Explore all authors</span>
                 <ArrowRight className="w-3.5 h-3.5" />
               </button>
             </div>
 
-            <div className="grid grid-cols-1 min-[541px]:grid-cols-2 min-[851px]:grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 min-[541px]:grid-cols-2 min-[851px]:grid-cols-3 gap-3 sm:gap-4">
               {authors.slice(0, 3).map((author) => (
                 <div
                   key={author.id}
@@ -2303,18 +2662,18 @@ export default function WorldBookRecords({
                   tabIndex={0}
                   role="button"
                   aria-label={`View books by ${author.name}`}
-                  className="flex items-center gap-[14px] bg-[#141417] border border-[#292621] hover:border-[#806633] rounded-[12px] p-[17px] transition-colors cursor-pointer"
+                  className="flex items-center gap-3.5 bg-[#141417] border border-[#292621] hover:border-[#806633] rounded-[12px] p-4 transition-colors cursor-pointer"
                 >
                   <div
-                    className="w-[56px] h-[56px] rounded-full grid place-items-center text-[#ffe6a8] font-serif text-[24px] border border-[#b08b48] shrink-0"
+                    className="w-[52px] h-[52px] sm:w-[56px] sm:h-[56px] rounded-full grid place-items-center text-[#ffe6a8] font-serif text-[22px] sm:text-[24px] border border-[#b08b48] shrink-0"
                     style={{
                       background: 'linear-gradient(145deg, #76572b, #242018)',
                     }}
                   >
                     {author.initials}
                   </div>
-                  <div>
-                    <h3 className="font-serif text-[17px] m-0 font-normal">
+                  <div className="min-w-0 flex-1">
+                    <h3 className="font-serif text-[16.5px] sm:text-[17px] m-0 font-normal truncate">
                       {author.name}{' '}
                       {author.verified && (
                         <span className="text-[#d8b35d] text-[10px] font-sans font-semibold tracking-wide">
@@ -2322,10 +2681,10 @@ export default function WorldBookRecords({
                         </span>
                       )}
                     </h3>
-                    <p className="text-[#a7a3a0] text-[11px] my-[3px]">
+                    <p className="text-[#a7a3a0] text-[11.5px] my-[3px] truncate">
                       {author.country} · {author.genre}
                     </p>
-                    <p className="text-[#a7a3a0] text-[11px] my-[3px]">
+                    <p className="text-[#a7a3a0] text-[11.5px] my-[3px]">
                       {author.publishedCount} published books
                     </p>
                   </div>
@@ -2336,39 +2695,41 @@ export default function WorldBookRecords({
         </section>
 
         {/* Literary Milestones Section */}
-        <section id="records" className="py-[68px]">
-          <div className="w-[min(1160px,92%)] mx-auto">
-            <div className="flex flex-col sm:flex-row items-start sm:items-end justify-between gap-5 mb-[27px]">
+        <section id="records" className="py-12 sm:py-[68px]">
+          <div className="w-[min(1160px,100%)] mx-auto px-4 sm:px-6">
+            <div className="flex flex-col sm:flex-row items-start sm:items-end justify-between gap-3 sm:gap-5 mb-5 sm:mb-[27px]">
               <div>
-                <div className="text-[#d8b35d] text-[11px] font-extrabold tracking-[3px] uppercase">
+                <div className="text-[#d8b35d] text-[10.5px] sm:text-[11px] font-extrabold tracking-[2.6px] sm:tracking-[3px] uppercase">
                   Celebrate achievement
                 </div>
-                <h2 className="font-serif text-[30px] sm:text-[36px] mt-[7px] mb-0 font-normal">
+                <h2 className="font-serif text-[27px] sm:text-[36px] mt-[6px] mb-0 font-normal leading-tight">
                   Literary milestones
                 </h2>
               </div>
-              <p className="text-[#a7a3a0] m-0 max-w-[420px]">
+              <p className="text-[#a7a3a0] m-0 max-w-[420px] text-[14px] sm:text-[15px]">
                 Recognise meaningful contributions to reading, writing and publishing.
                 Records are reviewed before verification.
               </p>
             </div>
 
-            <div className="grid grid-cols-1 min-[541px]:grid-cols-2 min-[851px]:grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 min-[541px]:grid-cols-2 min-[851px]:grid-cols-3 gap-3 sm:gap-4">
               {records.map((record) => (
                 <div
                   key={record.number}
-                  className="border border-[#514022] rounded-[13px] p-[22px]"
+                  className="border border-[#514022] rounded-[13px] p-5 sm:p-[22px]"
                   style={{
                     background: 'linear-gradient(145deg, #211b10, #141417)',
                   }}
                 >
-                  <div className="font-serif text-[34px] text-[#d8b35d] tabular-nums">
+                  <div className="font-serif text-[30px] sm:text-[34px] text-[#d8b35d] tabular-nums">
                     {record.number}
                   </div>
-                  <h3 className="font-serif text-[19px] my-[7px] font-normal">
+                  <h3 className="font-serif text-[18px] sm:text-[19px] my-[6px] font-normal">
                     {record.title}
                   </h3>
-                  <p className="text-[#a7a3a0] text-[12px] m-0">{record.description}</p>
+                  <p className="text-[#a7a3a0] text-[12.5px] m-0 leading-relaxed">
+                    {record.description}
+                  </p>
                 </div>
               ))}
             </div>
@@ -2376,22 +2737,22 @@ export default function WorldBookRecords({
         </section>
 
         {/* Publish CTA Banner */}
-        <section id="publish" className="py-[68px]">
-          <div className="w-[min(1160px,92%)] mx-auto">
+        <section id="publish" className="py-12 sm:py-[68px]">
+          <div className="w-[min(1160px,100%)] mx-auto px-4 sm:px-6">
             <div
-              className="border border-[#514022] rounded-[18px] p-6 sm:p-[34px] flex flex-col min-[541px]:flex-row justify-between items-start min-[541px]:items-center gap-6"
+              className="border border-[#514022] rounded-[18px] p-5 sm:p-[34px] flex flex-col min-[541px]:flex-row justify-between items-start min-[541px]:items-center gap-5 sm:gap-6"
               style={{
                 background: 'linear-gradient(110deg, #211a0e, #141417)',
               }}
             >
               <div>
-                <div className="text-[#d8b35d] text-[11px] font-extrabold tracking-[3px] uppercase">
+                <div className="text-[#d8b35d] text-[10.5px] sm:text-[11px] font-extrabold tracking-[2.6px] sm:tracking-[3px] uppercase">
                   Your story belongs here
                 </div>
-                <h2 className="font-serif text-[32px] my-2 font-normal">
+                <h2 className="font-serif text-[26px] sm:text-[32px] my-2 font-normal leading-tight">
                   Ready to publish your book?
                 </h2>
-                <p className="text-[#a7a3a0] max-w-[560px] m-0">
+                <p className="text-[#a7a3a0] max-w-[560px] m-0 text-[14px] sm:text-[15px]">
                   Create your author profile, upload your manuscript, choose free or paid
                   access, and share your work with a global reading community.
                 </p>
@@ -2401,7 +2762,7 @@ export default function WorldBookRecords({
                 onClick={() =>
                   signedInUser ? setProfileModalOpen(true) : openAuthModal('publish')
                 }
-                className="inline-flex items-center gap-1.5 border border-[#d8b35d] rounded-[9px] px-4 py-2.5 text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] font-bold cursor-pointer transition-colors whitespace-nowrap shrink-0"
+                className="w-full min-[541px]:w-auto inline-flex items-center justify-center gap-1.5 border border-[#d8b35d] rounded-[9px] px-4 py-3 sm:py-2.5 text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] font-bold cursor-pointer transition-colors whitespace-nowrap shrink-0 min-h-[44px]"
               >
                 <span>Become an author</span>
                 <ArrowUpRight className="w-4 h-4" />
@@ -2412,8 +2773,8 @@ export default function WorldBookRecords({
       </main>
 
       {/* Footer */}
-      <footer className="border-t border-[#302c25] py-[34px] text-[#a7a3a0] text-[12px]">
-        <div className="w-[min(1160px,92%)] mx-auto flex justify-between gap-5 flex-wrap">
+      <footer className="border-t border-[#302c25] py-7 sm:py-[34px] text-[#a7a3a0] text-[12px]">
+        <div className="w-[min(1160px,100%)] mx-auto px-4 sm:px-6 flex justify-between gap-4 sm:gap-5 flex-wrap">
           <div>
             <b className="text-[#d8b35d]">WORLD BOOK RECORDS</b>
             <br />
@@ -2433,6 +2794,14 @@ export default function WorldBookRecords({
                   {index < INFO_PAGES.length - 1 && <span aria-hidden="true">·</span>}
                 </React.Fragment>
               ))}
+              <span aria-hidden="true">·</span>
+              <button
+                type="button"
+                onClick={() => setAdminPanelOpen(true)}
+                className="hover:text-[#d8b35d] transition-colors cursor-pointer bg-transparent border-0 p-0 text-inherit"
+              >
+                Admin
+              </button>
             </div>
             <div>© 2026 World Book Records.</div>
           </div>
@@ -2450,7 +2819,7 @@ export default function WorldBookRecords({
             onClick={(e) => {
               if (e.target === e.currentTarget) setProfileModalOpen(false);
             }}
-            className="fixed inset-0 z-30 bg-black/80 grid place-items-center p-[18px]"
+            className="fixed inset-0 z-30 bg-black/80 grid place-items-center p-3 sm:p-[18px] overscroll-contain"
             role="dialog"
             aria-modal="true"
             aria-labelledby="profile-modal-title"
@@ -2460,19 +2829,19 @@ export default function WorldBookRecords({
               animate={{opacity: 1, scale: 1, y: 0}}
               exit={{opacity: 0, scale: 0.97, y: 8}}
               transition={{duration: 0.16}}
-              className="w-[min(860px,100%)] max-h-[90vh] overflow-y-auto bg-[#141417] border border-[#66512d] rounded-[18px] p-6 sm:p-8 relative"
+              className="w-[min(860px,100%)] max-h-[90vh] overflow-y-auto overscroll-contain bg-[#141417] border border-[#66512d] rounded-[16px] sm:rounded-[18px] p-4 sm:p-8 relative"
             >
               <button
                 type="button"
                 onClick={() => setProfileModalOpen(false)}
                 aria-label="Close profile"
-                className="absolute right-[16px] top-[14px] bg-transparent border-0 text-[#aaa] hover:text-white cursor-pointer p-1"
+                className="absolute right-3 top-3 sm:right-[16px] sm:top-[14px] bg-transparent border-0 text-[#aaa] hover:text-white cursor-pointer p-2"
               >
                 <X className="w-5 h-5" />
               </button>
 
               {/* Top: Centered Photo */}
-              <div className="flex flex-col items-center text-center">
+              <div className="flex flex-col items-center text-center pt-2">
                 <div className="relative">
                   <div
                     className="w-24 h-24 sm:w-28 sm:h-28 rounded-full border-2 border-[#d8b35d] overflow-hidden grid place-items-center text-[#ffe6a8] font-serif text-[34px] shadow-[0_12px_30px_rgba(0,0,0,0.6)]"
@@ -2515,11 +2884,11 @@ export default function WorldBookRecords({
                 {/* Middle: Name */}
                 <h2
                   id="profile-modal-title"
-                  className="font-serif text-[28px] sm:text-[34px] mt-4 mb-1 font-normal text-[#f7f4ed]"
+                  className="font-serif text-[26px] sm:text-[34px] mt-4 mb-1 font-normal text-[#f7f4ed] break-words max-w-full"
                 >
                   {signedInUser.name}
                 </h2>
-                <p className="text-[13px] text-[#a7a3a0] m-0">
+                <p className="text-[12.5px] sm:text-[13px] text-[#a7a3a0] m-0 break-all sm:break-normal">
                   {signedInUser.role}
                   {signedInUser.email ? ` · ${signedInUser.email}` : ''}
                   {' · '}
@@ -2529,14 +2898,14 @@ export default function WorldBookRecords({
                   </span>
                 </p>
 
-                <div className="flex items-center gap-3 mt-4 flex-wrap justify-center">
+                <div className="flex items-center gap-2 sm:gap-3 mt-4 flex-wrap justify-center w-full sm:w-auto">
                   <button
                     type="button"
                     onClick={() => {
                       setProfileModalOpen(false);
                       openAuthModal('publish');
                     }}
-                    className="inline-flex items-center gap-1.5 border border-[#d8b35d] rounded-[9px] px-4 py-2 text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] font-bold text-[13px] cursor-pointer transition-colors"
+                    className="w-full sm:w-auto inline-flex items-center justify-center gap-1.5 border border-[#d8b35d] rounded-[9px] px-4 py-2.5 text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] font-bold text-[13px] cursor-pointer transition-colors min-h-[42px]"
                   >
                     <Upload className="w-4 h-4" />
                     <span>Upload &amp; publish book</span>
@@ -2544,14 +2913,27 @@ export default function WorldBookRecords({
                   <button
                     type="button"
                     onClick={() => profileFileInputRef.current?.click()}
-                    className="border border-[#302c25] rounded-[9px] px-4 py-2 text-[#d2cec5] bg-[#0b0b0d] hover:border-[#d8b35d] hover:text-[#d8b35d] font-semibold text-[13px] cursor-pointer transition-colors"
+                    className="flex-1 sm:flex-initial border border-[#302c25] rounded-[9px] px-3.5 py-2 text-[#d2cec5] bg-[#0b0b0d] hover:border-[#d8b35d] hover:text-[#d8b35d] font-semibold text-[13px] cursor-pointer transition-colors min-h-[40px]"
                   >
                     Change photo
                   </button>
+                  {(isAdminAccount || adminToken) && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setProfileModalOpen(false);
+                        setAdminPanelOpen(true);
+                      }}
+                      className="flex-1 sm:flex-initial inline-flex items-center justify-center gap-1.5 border border-[#806633] rounded-[9px] px-3.5 py-2 text-[#d8b35d] bg-[#211b10] hover:border-[#d8b35d] font-semibold text-[13px] cursor-pointer transition-colors min-h-[40px]"
+                    >
+                      <ShieldCheck className="w-4 h-4" />
+                      <span>Admin Panel</span>
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={handleSignOut}
-                    className="border border-[#302c25] rounded-[9px] px-4 py-2 text-[#a7a3a0] bg-transparent hover:border-[#d8b35d] hover:text-[#d8b35d] font-semibold text-[13px] cursor-pointer transition-colors"
+                    className="flex-1 sm:flex-initial border border-[#302c25] rounded-[9px] px-3.5 py-2 text-[#a7a3a0] bg-transparent hover:border-[#d8b35d] hover:text-[#d8b35d] font-semibold text-[13px] cursor-pointer transition-colors min-h-[40px]"
                   >
                     Sign out
                   </button>
@@ -2559,18 +2941,33 @@ export default function WorldBookRecords({
               </div>
 
               {/* Bottom: Published Books */}
-              <div className="mt-7 pt-6 border-t border-[#302c25]">
-                <div className="mb-4">
-                  <div className="text-[#d8b35d] text-[10px] font-extrabold tracking-[2.5px] uppercase">
-                    Author Shelf
+              <div className="mt-6 sm:mt-7 pt-5 sm:pt-6 border-t border-[#302c25]">
+                <div className="mb-4 flex flex-col sm:flex-row sm:items-end justify-between gap-2">
+                  <div>
+                    <div className="text-[#d8b35d] text-[10px] font-extrabold tracking-[2.5px] uppercase">
+                      Author Shelf
+                    </div>
+                    <h3 className="font-serif text-[20px] sm:text-[22px] m-0 mt-1 font-normal">
+                      Submissions by {signedInUser.name}
+                    </h3>
                   </div>
-                  <h3 className="font-serif text-[22px] m-0 mt-1 font-normal">
-                    Published books by {signedInUser.name}
-                  </h3>
+                  {myPublishedBooks.length > 0 && (
+                    <div className="flex flex-wrap items-center gap-3 text-[11.5px] font-semibold">
+                      <span className="text-emerald-400 tabular-nums">
+                        {myStatusCounts.approved} Published
+                      </span>
+                      <span className="text-amber-300 tabular-nums">
+                        {myStatusCounts.pending} Pending
+                      </span>
+                      <span className="text-red-400 tabular-nums">
+                        {myStatusCounts.rejected} Rejected
+                      </span>
+                    </div>
+                  )}
                 </div>
 
                 {myPublishedBooks.length > 0 ? (
-                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 sm:gap-4">
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5 sm:gap-4">
                     {myPublishedBooks.map((book) => (
                       <article
                         key={book.id}
@@ -2588,13 +2985,13 @@ export default function WorldBookRecords({
                         tabIndex={0}
                         role="button"
                         aria-label={`Read preview of ${book.title}`}
-                        className="bg-[#0d0d10] border border-[#292621] rounded-[13px] p-3 transition duration-200 hover:-translate-y-1 hover:border-[#806633] cursor-pointer focus-visible:outline-2 focus-visible:outline-[#d8b35d]"
+                        className="bg-[#0d0d10] border border-[#292621] rounded-[13px] p-2.5 sm:p-3 transition duration-200 hover:-translate-y-1 hover:border-[#806633] cursor-pointer focus-visible:outline-2 focus-visible:outline-[#d8b35d] flex flex-col justify-between"
                       >
                         <div
-                          className={`h-[155px] sm:h-[185px] rounded-[7px] flex flex-col justify-between shadow-[inset_5px_0_rgba(255,255,255,0.08)] relative overflow-hidden ${COVER_GRADIENTS[book.coverVariant]} ${
+                          className={`aspect-[2/3] w-full rounded-[7px] flex flex-col justify-between shadow-[inset_5px_0_rgba(255,255,255,0.08)] relative overflow-hidden ${COVER_GRADIENTS[book.coverVariant]} ${
                             book.coverImageUrl && !bookCoverErrors[book.id]
                               ? ''
-                              : 'p-3.5'
+                              : 'p-3 sm:p-3.5'
                           }`}
                         >
                           {book.coverImageUrl && !bookCoverErrors[book.id] ? (
@@ -2637,66 +3034,99 @@ export default function WorldBookRecords({
                           )}
                         </div>
 
-                        <div className="pt-2.5 px-0.5 pb-0.5">
-                          <h4 className="font-serif text-[16px] m-0 mb-1 font-normal">
-                            {book.title}
-                          </h4>
-                          <div className="text-[12px] text-[#a7a3a0]">by {book.author}</div>
-                          <div className="flex justify-between items-center mt-2.5 text-[12px]">
-                            <span className="text-[#d7c18e] text-[11px]">
-                              {book.category}
-                              {book.bookFileName
-                                ? ` · ${getFileExtensionLabel(book.bookFileName)}`
-                                : ''}
-                            </span>
-                            <span className="text-[#d8b35d] font-extrabold tabular-nums">
-                              {book.priceLabel}
-                            </span>
+                        <div className="pt-2.5 px-0.5 pb-0.5 flex-1 flex flex-col justify-between">
+                          <div>
+                            <h4 className="font-serif text-[14.5px] sm:text-[16px] m-0 mb-0.5 font-normal line-clamp-2">
+                              {book.title}
+                            </h4>
+                            <div className="text-[11.5px] sm:text-[12px] text-[#a7a3a0] truncate">
+                              by {book.author}
+                            </div>
                           </div>
+                          <div>
+                            <div className="flex justify-between items-center mt-2 text-[11px] sm:text-[12px] gap-1">
+                              <span className="text-[#d7c18e] truncate">
+                                {book.category}
+                                {book.bookFileName
+                                  ? ` · ${getFileExtensionLabel(book.bookFileName)}`
+                                  : ''}
+                              </span>
+                              <span className="text-[#d8b35d] font-extrabold tabular-nums shrink-0">
+                                {book.priceLabel}
+                              </span>
+                            </div>
 
-                          <div
-                            onClick={(e) => e.stopPropagation()}
-                            className="mt-3 pt-2.5 border-t border-[#24211c] flex items-center gap-1.5 flex-wrap"
-                          >
-                            {deleteConfirmBookId === book.id ? (
-                              <>
-                                <button
-                                  type="button"
-                                  disabled={deletingBookId === book.id}
-                                  onClick={() => handleDeleteBook(book)}
-                                  className="flex-1 inline-flex items-center justify-center gap-1 rounded-[7px] px-2 py-1.5 text-[11px] font-bold bg-red-600 hover:bg-red-500 text-white border-0 cursor-pointer disabled:opacity-60 transition-colors"
-                                >
-                                  {deletingBookId === book.id ? 'Deleting…' : 'Confirm'}
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => setDeleteConfirmBookId(null)}
-                                  className="flex-1 rounded-[7px] px-2 py-1.5 text-[11px] font-semibold bg-[#17161b] border border-[#302c25] text-[#d2cec5] hover:border-[#d8b35d] cursor-pointer transition-colors"
-                                >
-                                  Cancel
-                                </button>
-                              </>
-                            ) : (
-                              <>
-                                <button
-                                  type="button"
-                                  onClick={() => openEditBookModal(book)}
-                                  className="flex-1 inline-flex items-center justify-center gap-1 rounded-[7px] px-2 py-1.5 text-[11px] font-semibold bg-[#17161b] border border-[#302c25] text-[#f7f4ed] hover:border-[#d8b35d] hover:text-[#d8b35d] cursor-pointer transition-colors"
-                                >
-                                  <Pencil className="w-3 h-3" />
-                                  <span>Edit</span>
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => setDeleteConfirmBookId(book.id)}
-                                  className="inline-flex items-center justify-center gap-1 rounded-[7px] px-2.5 py-1.5 text-[11px] font-semibold bg-[#17161b] border border-[#302c25] text-red-300 hover:border-red-500/60 hover:text-red-200 cursor-pointer transition-colors"
-                                  aria-label={`Delete ${book.title}`}
-                                >
-                                  <Trash2 className="w-3 h-3" />
-                                  <span>Delete</span>
-                                </button>
-                              </>
-                            )}
+                            {/* Approval / Rejection Status Visible to Author */}
+                            <div className="mt-2 pt-2 border-t border-[#201d18]">
+                              {book.status === 'rejected' ? (
+                                <div className="text-[11px] text-red-400 font-semibold leading-snug">
+                                  <span className="inline-flex items-center gap-1">
+                                    <XCircle className="w-3 h-3 shrink-0" />
+                                    <span>Rejected · Not Published</span>
+                                  </span>
+                                  {book.rejectionReason && (
+                                    <div className="text-[10.5px] text-red-300/85 font-normal mt-0.5 line-clamp-2">
+                                      Reason: {book.rejectionReason}
+                                    </div>
+                                  )}
+                                </div>
+                              ) : book.status === 'pending' ? (
+                                <div className="text-[11px] text-amber-300 font-semibold inline-flex items-center gap-1">
+                                  <Clock className="w-3 h-3 shrink-0" />
+                                  <span>Pending Admin Review</span>
+                                </div>
+                              ) : (
+                                <div className="text-[11px] text-emerald-400 font-semibold inline-flex items-center gap-1">
+                                  <CheckCircle2 className="w-3 h-3 shrink-0" />
+                                  <span>Published Publicly</span>
+                                </div>
+                              )}
+                            </div>
+
+                            <div
+                              onClick={(e) => e.stopPropagation()}
+                              className="mt-2.5 pt-2 border-t border-[#24211c] flex items-center gap-1.5 flex-wrap"
+                            >
+                              {deleteConfirmBookId === book.id ? (
+                                <>
+                                  <button
+                                    type="button"
+                                    disabled={deletingBookId === book.id}
+                                    onClick={() => handleDeleteBook(book)}
+                                    className="flex-1 inline-flex items-center justify-center gap-1 rounded-[7px] px-2 py-2 text-[11px] font-bold bg-red-600 hover:bg-red-500 text-white border-0 cursor-pointer disabled:opacity-60 transition-colors min-h-[38px]"
+                                  >
+                                    {deletingBookId === book.id ? 'Deleting…' : 'Confirm'}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setDeleteConfirmBookId(null)}
+                                    className="flex-1 rounded-[7px] px-2 py-2 text-[11px] font-semibold bg-[#17161b] border border-[#302c25] text-[#d2cec5] hover:border-[#d8b35d] cursor-pointer transition-colors min-h-[38px]"
+                                  >
+                                    Cancel
+                                  </button>
+                                </>
+                              ) : (
+                                <>
+                                  <button
+                                    type="button"
+                                    onClick={() => openEditBookModal(book)}
+                                    className="flex-1 inline-flex items-center justify-center gap-1 rounded-[7px] px-2 py-1.5 text-[11px] font-semibold bg-[#17161b] border border-[#302c25] text-[#f7f4ed] hover:border-[#d8b35d] hover:text-[#d8b35d] cursor-pointer transition-colors min-h-[38px]"
+                                  >
+                                    <Pencil className="w-3 h-3" />
+                                    <span>Edit</span>
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setDeleteConfirmBookId(book.id)}
+                                    className="flex-1 inline-flex items-center justify-center gap-1 rounded-[7px] px-2 py-1.5 text-[11px] font-semibold bg-[#17161b] border border-[#302c25] text-red-300 hover:border-red-500/60 hover:text-red-200 cursor-pointer transition-colors min-h-[38px]"
+                                    aria-label={`Delete ${book.title}`}
+                                  >
+                                    <Trash2 className="w-3 h-3" />
+                                    <span>Delete</span>
+                                  </button>
+                                </>
+                              )}
+                            </div>
                           </div>
                         </div>
                       </article>
@@ -2745,7 +3175,7 @@ export default function WorldBookRecords({
                 setEditingBook(null);
               }
             }}
-            className="fixed inset-0 z-30 bg-black/75 grid place-items-center p-[18px]"
+            className="fixed inset-0 z-30 bg-black/75 grid place-items-center p-3 sm:p-[18px] overscroll-contain"
             role="dialog"
             aria-modal="true"
             aria-labelledby="auth-modal-title"
@@ -2757,7 +3187,7 @@ export default function WorldBookRecords({
               transition={{duration: 0.16}}
               className={`${
                 authModalMode === 'publish' ? 'w-[min(560px,100%)]' : 'w-[min(480px,100%)]'
-              } max-h-[90vh] overflow-y-auto bg-[#171619] border border-[#66512d] rounded-[16px] p-[25px] relative`}
+              } max-h-[90vh] overflow-y-auto overscroll-contain bg-[#171619] border border-[#66512d] rounded-[16px] p-4 sm:p-[25px] relative`}
             >
               <button
                 type="button"
@@ -2766,12 +3196,12 @@ export default function WorldBookRecords({
                   setEditingBook(null);
                 }}
                 aria-label="Close modal"
-                className="absolute right-[15px] top-[12px] bg-transparent border-0 text-[#aaa] hover:text-white cursor-pointer p-1"
+                className="absolute right-3 top-3 sm:right-[15px] sm:top-[12px] bg-transparent border-0 text-[#aaa] hover:text-white cursor-pointer p-2"
               >
                 <X className="w-5 h-5" />
               </button>
 
-              <h2 id="auth-modal-title" className="font-serif text-[27px] m-0 mb-2 font-normal">
+              <h2 id="auth-modal-title" className="font-serif text-[23px] sm:text-[27px] m-0 mb-1.5 pr-8 font-normal">
                 {modalMeta[authModalMode].title}
               </h2>
               <p className="text-[#a7a3a0] text-[13px] mb-4">
@@ -2883,7 +3313,7 @@ export default function WorldBookRecords({
                     value={fullName}
                     onChange={(e) => setFullName(e.target.value)}
                     placeholder="Your full name"
-                    className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-white outline-none"
+                    className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-[16px] sm:text-[14px] text-white outline-none"
                   />
                 )}
                 {!signedInUser && (
@@ -2894,7 +3324,7 @@ export default function WorldBookRecords({
                       value={email}
                       onChange={(e) => setEmail(e.target.value)}
                       placeholder="Email address"
-                      className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-white outline-none"
+                      className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-[16px] sm:text-[14px] text-white outline-none"
                     />
                     <input
                       type="password"
@@ -2905,7 +3335,7 @@ export default function WorldBookRecords({
                       placeholder={
                         authModalMode === 'login' ? 'Password' : 'Create password'
                       }
-                      className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-white outline-none"
+                      className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-[16px] sm:text-[14px] text-white outline-none"
                     />
                   </>
                 )}
@@ -3011,7 +3441,7 @@ export default function WorldBookRecords({
                         value={bookTitleInput}
                         onChange={(e) => setBookTitleInput(e.target.value)}
                         placeholder="e.g. Echoes of Dawn"
-                        className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-white outline-none"
+                        className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-[16px] sm:text-[14px] text-white outline-none"
                       />
                     </div>
 
@@ -3026,7 +3456,7 @@ export default function WorldBookRecords({
                         value={bookDescriptionInput}
                         onChange={(e) => setBookDescriptionInput(e.target.value)}
                         placeholder="Write a short summary or description of your book..."
-                        className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-white outline-none resize-y text-[13.5px] leading-relaxed"
+                        className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-[16px] sm:text-[13.5px] text-white outline-none resize-y leading-relaxed"
                       />
                     </div>
 
@@ -3043,7 +3473,7 @@ export default function WorldBookRecords({
                         value={bookContentInput}
                         onChange={(e) => setBookContentInput(e.target.value)}
                         placeholder="Write or paste chapters / story text here so readers can read right inside the reader..."
-                        className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-white outline-none resize-y text-[13.5px] leading-relaxed"
+                        className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-[16px] sm:text-[13.5px] text-white outline-none resize-y leading-relaxed"
                       />
                     </div>
 
@@ -3059,7 +3489,7 @@ export default function WorldBookRecords({
                             setBookCategoryInput(e.target.value as BookCategory)
                           }
                           aria-label="Book category"
-                          className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-white outline-none"
+                          className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-[16px] sm:text-[14px] text-white outline-none"
                         >
                           <option value="Fiction">Fiction</option>
                           <option value="History">History</option>
@@ -3077,7 +3507,7 @@ export default function WorldBookRecords({
                             setBookAccessInput(e.target.value as BookAccessType)
                           }
                           aria-label="Price option"
-                          className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-white outline-none"
+                          className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-[16px] sm:text-[14px] text-white outline-none"
                         >
                           <option value="Free">Free (Open access)</option>
                           <option value="Paid">Paid edition (Set price)</option>
@@ -3096,7 +3526,7 @@ export default function WorldBookRecords({
                           value={bookPriceInput}
                           onChange={(e) => setBookPriceInput(e.target.value)}
                           placeholder="Enter price (e.g. $4.99 or ৳250)"
-                          className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-white outline-none"
+                          className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-[16px] sm:text-[14px] text-white outline-none"
                         />
                       ) : (
                         <div className="w-full px-3 py-2.5 bg-[#0d0d0f] border border-[#302c25] rounded-[8px] text-[13px] text-[#d8b35d] flex items-center justify-between">
@@ -3247,7 +3677,7 @@ export default function WorldBookRecords({
                 setSelectedBook(null);
               }
             }}
-            className="fixed inset-0 z-30 bg-black/75 grid place-items-center p-[18px]"
+            className="fixed inset-0 z-30 bg-black/75 grid place-items-center p-3 sm:p-[18px] overscroll-contain"
             role="dialog"
             aria-modal="true"
             aria-labelledby="book-preview-title"
@@ -3257,7 +3687,7 @@ export default function WorldBookRecords({
               animate={{opacity: 1, scale: 1, y: 0}}
               exit={{opacity: 0, scale: 0.97, y: 8}}
               transition={{duration: 0.16}}
-              className="w-[min(640px,100%)] max-h-[90vh] overflow-y-auto bg-[#171619] border border-[#66512d] rounded-[16px] p-[25px] relative"
+              className="w-[min(640px,100%)] max-h-[90vh] overflow-y-auto overscroll-contain bg-[#171619] border border-[#66512d] rounded-[16px] p-4 sm:p-[25px] relative"
             >
               <button
                 type="button"
@@ -3266,14 +3696,14 @@ export default function WorldBookRecords({
                   setSelectedBook(null);
                 }}
                 aria-label="Close book preview"
-                className="absolute right-[15px] top-[12px] bg-transparent border-0 text-[#aaa] hover:text-white cursor-pointer p-1"
+                className="absolute right-3 top-3 sm:right-[15px] sm:top-[12px] bg-transparent border-0 text-[#aaa] hover:text-white cursor-pointer p-2"
               >
                 <X className="w-5 h-5" />
               </button>
 
-              <div className="flex flex-col sm:flex-row gap-5">
+              <div className="flex flex-col sm:flex-row gap-4 sm:gap-5 pt-2 sm:pt-0">
                 <div
-                  className={`w-[150px] h-[225px] shrink-0 rounded-[7px] flex flex-col justify-between shadow-[inset_5px_0_rgba(255,255,255,0.08)] relative overflow-hidden ${COVER_GRADIENTS[selectedBook.coverVariant]} ${
+                  className={`w-[136px] sm:w-[150px] aspect-[2/3] mx-auto sm:mx-0 shrink-0 rounded-[7px] flex flex-col justify-between shadow-[inset_5px_0_rgba(255,255,255,0.08)] relative overflow-hidden ${COVER_GRADIENTS[selectedBook.coverVariant]} ${
                     selectedBook.coverImageUrl && !bookCoverErrors[selectedBook.id]
                       ? ''
                       : 'p-4'
@@ -3315,23 +3745,45 @@ export default function WorldBookRecords({
                   )}
                 </div>
 
-                <div className="flex-1 min-w-0">
-                  <div className="text-[#d8b35d] text-[11px] font-bold tracking-[2px] uppercase">
+                <div className="flex-1 min-w-0 text-center sm:text-left">
+                  <div className="text-[#d8b35d] text-[10.5px] sm:text-[11px] font-bold tracking-[1.8px] sm:tracking-[2px] uppercase">
                     {selectedBook.category} · {selectedBook.publishedYear} ·{' '}
                     {selectedBook.pages} pages
                   </div>
                   <h2
                     id="book-preview-title"
-                    className="font-serif text-[26px] mt-1.5 mb-1 font-normal"
+                    className="font-serif text-[23px] sm:text-[26px] mt-1.5 mb-1 font-normal break-words"
                   >
                     {selectedBook.title}
                   </h2>
                   <p className="text-[#a7a3a0] text-[13px] m-0 mb-3">
                     by {selectedBook.author}
                   </p>
-                  <p className="text-[#d2cec5] text-[13.5px] leading-relaxed m-0 mb-4">
+                  <p className="text-[#d2cec5] text-[13.5px] leading-relaxed m-0 mb-2 sm:mb-4 text-left">
                     {selectedBook.synopsis}
                   </p>
+                  {selectedBook.status === 'rejected' && (
+                    <div className="mt-2 rounded-[10px] border border-red-800/70 bg-red-950/35 px-3 py-2 text-left text-[12px] text-red-200">
+                      <div className="font-bold flex items-center gap-1.5 text-red-300">
+                        <XCircle className="w-3.5 h-3.5 shrink-0" />
+                        <span>Rejected by Admin — Not Published Publicly</span>
+                      </div>
+                      {selectedBook.rejectionReason && (
+                        <div className="mt-0.5 text-red-200/90">
+                          Reason: {selectedBook.rejectionReason}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {selectedBook.status === 'pending' && (
+                    <div className="mt-2 rounded-[10px] border border-amber-700/60 bg-amber-950/30 px-3 py-2 text-left text-[12px] text-amber-200 flex items-center gap-1.5">
+                      <Clock className="w-3.5 h-3.5 shrink-0 text-amber-300" />
+                      <span>
+                        Pending Admin review — visible only to you and Admins until
+                        accepted.
+                      </span>
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -3398,7 +3850,7 @@ export default function WorldBookRecords({
                 </blockquote>
               </div>
 
-              <div className="mt-5 flex flex-wrap items-center justify-between gap-3">
+              <div className="mt-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                 <div>
                   <span className="text-[#d8b35d] font-extrabold text-[16px] tabular-nums">
                     {selectedBook.priceLabel}
@@ -3415,7 +3867,7 @@ export default function WorldBookRecords({
                       <button
                         type="button"
                         onClick={() => openEditBookModal(selectedBook)}
-                        className="inline-flex items-center gap-1.5 border border-[#302c25] hover:border-[#d8b35d] rounded-[9px] px-3 py-2 text-[#f7f4ed] bg-[#0d0d10] font-semibold text-[13px] cursor-pointer transition-colors"
+                        className="inline-flex items-center justify-center gap-1.5 border border-[#302c25] hover:border-[#d8b35d] rounded-[9px] px-3 py-2 text-[#f7f4ed] bg-[#0d0d10] font-semibold text-[13px] cursor-pointer transition-colors min-h-[40px]"
                       >
                         <Pencil className="w-3.5 h-3.5 text-[#d8b35d]" />
                         <span>Edit</span>
@@ -3426,7 +3878,7 @@ export default function WorldBookRecords({
                             type="button"
                             disabled={deletingBookId === selectedBook.id}
                             onClick={() => handleDeleteBook(selectedBook)}
-                            className="inline-flex items-center gap-1 rounded-[9px] px-3 py-2 text-[12.5px] font-bold bg-red-600 hover:bg-red-500 text-white border-0 cursor-pointer disabled:opacity-60 transition-colors"
+                            className="inline-flex items-center justify-center gap-1 rounded-[9px] px-3 py-2 text-[12.5px] font-bold bg-red-600 hover:bg-red-500 text-white border-0 cursor-pointer disabled:opacity-60 transition-colors min-h-[40px]"
                           >
                             {deletingBookId === selectedBook.id
                               ? 'Deleting…'
@@ -3435,7 +3887,7 @@ export default function WorldBookRecords({
                           <button
                             type="button"
                             onClick={() => setDeleteConfirmBookId(null)}
-                            className="border border-[#302c25] hover:border-[#d8b35d] rounded-[9px] px-2.5 py-2 text-[#d2cec5] bg-[#0d0d10] font-semibold text-[12.5px] cursor-pointer transition-colors"
+                            className="border border-[#302c25] hover:border-[#d8b35d] rounded-[9px] px-2.5 py-2 text-[#d2cec5] bg-[#0d0d10] font-semibold text-[12.5px] cursor-pointer transition-colors min-h-[40px]"
                           >
                             Cancel
                           </button>
@@ -3444,7 +3896,7 @@ export default function WorldBookRecords({
                         <button
                           type="button"
                           onClick={() => setDeleteConfirmBookId(selectedBook.id)}
-                          className="inline-flex items-center gap-1.5 border border-[#302c25] hover:border-red-500/60 rounded-[9px] px-3 py-2 text-red-300 hover:text-red-200 bg-[#0d0d10] font-semibold text-[13px] cursor-pointer transition-colors"
+                          className="inline-flex items-center justify-center gap-1.5 border border-[#302c25] hover:border-red-500/60 rounded-[9px] px-3 py-2 text-red-300 hover:text-red-200 bg-[#0d0d10] font-semibold text-[13px] cursor-pointer transition-colors min-h-[40px]"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                           <span>Delete</span>
@@ -3456,7 +3908,7 @@ export default function WorldBookRecords({
                     <button
                       type="button"
                       onClick={() => handleDownloadBookFile(selectedBook)}
-                      className="inline-flex items-center gap-1.5 border border-[#302c25] hover:border-[#d8b35d] rounded-[9px] px-3.5 py-2 text-[#f7f4ed] bg-[#0d0d10] font-semibold text-[13px] cursor-pointer transition-colors"
+                      className="inline-flex items-center justify-center gap-1.5 border border-[#302c25] hover:border-[#d8b35d] rounded-[9px] px-3.5 py-2 text-[#f7f4ed] bg-[#0d0d10] font-semibold text-[13px] cursor-pointer transition-colors min-h-[40px]"
                     >
                       <Download className="w-3.5 h-3.5 text-[#d8b35d]" />
                       <span>
@@ -3472,7 +3924,7 @@ export default function WorldBookRecords({
                       setSelectedBook(null);
                       setReaderBook(targetBook);
                     }}
-                    className="inline-flex items-center gap-1.5 border border-[#d8b35d] rounded-[9px] px-4 py-2 text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] font-bold text-[13px] cursor-pointer transition-colors"
+                    className="flex-1 sm:flex-initial inline-flex items-center justify-center gap-1.5 border border-[#d8b35d] rounded-[9px] px-4 py-2 text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] font-bold text-[13px] cursor-pointer transition-colors min-h-[42px]"
                   >
                     <BookOpen className="w-4 h-4" />
                     <span>
@@ -3545,7 +3997,7 @@ export default function WorldBookRecords({
                   <>
                     {/* Reader Top Controls Bar */}
                     <div
-                      className={`border-b px-4 sm:px-6 py-3 flex items-center justify-between gap-3 flex-wrap ${
+                      className={`border-b px-3 sm:px-6 py-2.5 sm:py-3 flex items-center justify-between gap-2.5 sm:gap-3 flex-wrap ${
                         readerTheme === 'sepia'
                           ? 'border-[#dfd2b5] bg-[#ede2c8]'
                           : readerTheme === 'light'
@@ -3553,11 +4005,11 @@ export default function WorldBookRecords({
                             : 'border-[#2b2720] bg-[#121215]'
                       }`}
                     >
-                      <div className="flex items-center gap-3 min-w-0">
+                      <div className="flex items-center gap-2.5 sm:gap-3 min-w-0 flex-1">
                         <button
                           type="button"
                           onClick={() => setReaderBook(null)}
-                          className={`inline-flex items-center gap-1.5 rounded-[8px] px-3 py-1.5 text-[12.5px] font-semibold border cursor-pointer transition-colors shrink-0 ${
+                          className={`inline-flex items-center gap-1.5 rounded-[8px] px-2.5 sm:px-3 py-1.5 text-[12.5px] font-semibold border cursor-pointer transition-colors shrink-0 min-h-[36px] ${
                             readerTheme === 'dark'
                               ? 'border-[#3a3326] text-[#f7f4ed] hover:border-[#d8b35d]'
                               : 'border-[#c8bba0] text-inherit hover:border-[#9e7d32]'
@@ -3567,10 +4019,10 @@ export default function WorldBookRecords({
                           <span>Back</span>
                         </button>
                         <div className="min-w-0">
-                          <div className="font-serif text-[16px] sm:text-[18px] truncate font-medium">
+                          <div className="font-serif text-[15px] sm:text-[18px] truncate font-medium">
                             {readerBook.title}
                           </div>
-                          <div className="text-[11.5px] opacity-75 truncate">
+                          <div className="text-[11px] sm:text-[11.5px] opacity-75 truncate">
                             by {readerBook.author} · {readerBook.category} ·{' '}
                             <span className="tabular-nums">
                               {readingProgress[readerBook.id] || 0}% read
@@ -3738,7 +4190,7 @@ export default function WorldBookRecords({
                       return next;
                     });
                   }}
-                  className="flex-1 overflow-y-auto px-5 sm:px-8 py-8 sm:py-12"
+                  className="flex-1 overflow-y-auto overscroll-contain px-4 sm:px-8 py-6 sm:py-12"
                 >
                   <article className="max-w-[68ch] mx-auto">
                     <div className="text-center pb-8 mb-8 border-b border-current/15">
@@ -3864,7 +4316,7 @@ export default function WorldBookRecords({
             onClick={(e) => {
               if (e.target === e.currentTarget) setAuthorsDirectoryOpen(false);
             }}
-            className="fixed inset-0 z-30 bg-black/75 grid place-items-center p-[18px]"
+            className="fixed inset-0 z-30 bg-black/75 grid place-items-center p-3 sm:p-[18px]"
             role="dialog"
             aria-modal="true"
             aria-labelledby="authors-directory-title"
@@ -3874,13 +4326,13 @@ export default function WorldBookRecords({
               animate={{opacity: 1, scale: 1, y: 0}}
               exit={{opacity: 0, scale: 0.97, y: 8}}
               transition={{duration: 0.16}}
-              className="w-[min(600px,100%)] max-h-[85vh] overflow-y-auto bg-[#171619] border border-[#66512d] rounded-[16px] p-[25px] relative"
+              className="w-[min(600px,100%)] max-h-[88dvh] overflow-y-auto overscroll-contain bg-[#171619] border border-[#66512d] rounded-[16px] p-4 sm:p-[25px] relative"
             >
               <button
                 type="button"
                 onClick={() => setAuthorsDirectoryOpen(false)}
                 aria-label="Close author directory"
-                className="absolute right-[15px] top-[12px] bg-transparent border-0 text-[#aaa] hover:text-white cursor-pointer p-1"
+                className="absolute right-3 top-3 bg-transparent border-0 text-[#aaa] hover:text-white cursor-pointer p-2 min-w-[40px] min-h-[40px] grid place-items-center"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -3952,7 +4404,7 @@ export default function WorldBookRecords({
             onClick={(e) => {
               if (e.target === e.currentTarget) setSelectedInfoPage(null);
             }}
-            className="fixed inset-0 z-30 bg-black/75 grid place-items-center p-[18px]"
+            className="fixed inset-0 z-30 bg-black/75 grid place-items-center p-3 sm:p-[18px]"
             role="dialog"
             aria-modal="true"
             aria-labelledby="info-modal-title"
@@ -3962,13 +4414,13 @@ export default function WorldBookRecords({
               animate={{opacity: 1, scale: 1, y: 0}}
               exit={{opacity: 0, scale: 0.97, y: 8}}
               transition={{duration: 0.16}}
-              className="w-[min(460px,100%)] bg-[#171619] border border-[#66512d] rounded-[16px] p-[25px] relative"
+              className="w-[min(460px,100%)] bg-[#171619] border border-[#66512d] rounded-[16px] p-4 sm:p-[25px] relative"
             >
               <button
                 type="button"
                 onClick={() => setSelectedInfoPage(null)}
                 aria-label="Close information dialog"
-                className="absolute right-[15px] top-[12px] bg-transparent border-0 text-[#aaa] hover:text-white cursor-pointer p-1"
+                className="absolute right-3 top-3 bg-transparent border-0 text-[#aaa] hover:text-white cursor-pointer p-2 min-w-[40px] min-h-[40px] grid place-items-center"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -3990,6 +4442,23 @@ export default function WorldBookRecords({
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* Admin Panel Modal */}
+      <AdminPanelModal
+        open={adminPanelOpen}
+        onClose={() => setAdminPanelOpen(false)}
+        books={booksWithStatus}
+        signedInUser={signedInUser}
+        supabaseClient={supabaseClient}
+        adminToken={adminToken}
+        onAdminTokenChange={setAdminToken}
+        onModerateBook={handleModerateBook}
+        onPreviewBook={(book) => {
+          setAdminPanelOpen(false);
+          setSelectedBook(book);
+        }}
+        localUsersFallback={localUsersForAdmin}
+      />
     </div>
   );
 }

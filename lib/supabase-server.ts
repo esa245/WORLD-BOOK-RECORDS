@@ -16,6 +16,8 @@ import {
   isValidBrowserSupabaseKey,
   PublicSupabaseConfig,
 } from '@/lib/supabase';
+import {getModerationMap} from '@/lib/admin-store';
+import type {BookModerationStatus} from '@/data/library';
 
 interface DbBookRow {
   id: string;
@@ -38,6 +40,8 @@ interface DbBookRow {
   published_year: number;
   synopsis: string;
   excerpt: string;
+  moderation_status?: BookModerationStatus | null;
+  rejection_reason?: string | null;
 }
 
 interface DbAuthorRow {
@@ -123,29 +127,49 @@ export async function loadInitialLibraryFromServer(): Promise<{
         .order('sort_order', {ascending: true}),
     ]);
 
+    const moderationMap = getModerationMap();
+
     const books: BookItem[] = !booksRes.error && booksRes.data
-      ? (booksRes.data as DbBookRow[]).map((row) => ({
-          id: row.id,
-          userId: row.user_id || undefined,
-          title: row.title,
-          titleLines: [row.title_line_1, row.title_line_2],
-          author: row.author_name,
-          category: row.category,
-          type: row.access_type,
-          priceLabel: row.price_label,
-          coverImageUrl: row.cover_image_url || undefined,
-          bookFileUrl: row.book_file_url || undefined,
-          bookFileName: row.book_file_name || undefined,
-          bookFileSize: row.book_file_size || undefined,
-          coverVariant: row.cover_variant,
-          coverKicker: row.cover_kicker,
-          coverFooter: row.cover_footer,
-          pages: row.pages,
-          publishedYear: row.published_year,
-          synopsis: row.synopsis,
-          excerpt: row.excerpt,
-        }))
-      : INITIAL_BOOKS;
+      ? (booksRes.data as DbBookRow[]).map((row) => {
+          const storeMod = moderationMap[row.id];
+          const status: BookModerationStatus =
+            row.moderation_status || storeMod?.status || 'approved';
+          const rejectionReason =
+            row.rejection_reason || storeMod?.rejectionReason || undefined;
+          return {
+            id: row.id,
+            userId: row.user_id || undefined,
+            title: row.title,
+            titleLines: [row.title_line_1, row.title_line_2],
+            author: row.author_name,
+            category: row.category,
+            type: row.access_type,
+            priceLabel: row.price_label,
+            coverImageUrl: row.cover_image_url || undefined,
+            bookFileUrl: row.book_file_url || undefined,
+            bookFileName: row.book_file_name || undefined,
+            bookFileSize: row.book_file_size || undefined,
+            coverVariant: row.cover_variant,
+            coverKicker: row.cover_kicker,
+            coverFooter: row.cover_footer,
+            pages: row.pages,
+            publishedYear: row.published_year,
+            synopsis: row.synopsis,
+            excerpt: row.excerpt,
+            status,
+            rejectionReason,
+          };
+        })
+      : INITIAL_BOOKS.map((book) => {
+          const storeMod = moderationMap[book.id];
+          return storeMod
+            ? {
+                ...book,
+                status: storeMod.status,
+                rejectionReason: storeMod.rejectionReason,
+              }
+            : {...book, status: 'approved'};
+        });
 
     const authors: AuthorItem[] = !authorsRes.error && authorsRes.data
       ? (authorsRes.data as DbAuthorRow[]).map((row) => ({
