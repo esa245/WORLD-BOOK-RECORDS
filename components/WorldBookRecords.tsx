@@ -3,6 +3,7 @@
 import React, {useEffect, useMemo, useRef, useState} from 'react';
 import {AnimatePresence, motion} from 'motion/react';
 import {
+  ArrowLeft,
   ArrowRight,
   ArrowUpRight,
   BookOpen,
@@ -12,9 +13,14 @@ import {
   FileText,
   ImagePlus,
   Menu,
+  Minus,
+  Moon,
+  Pencil,
   Plus,
   Search,
   Sparkles,
+  Sun,
+  Trash2,
   Upload,
   User,
   X,
@@ -36,6 +42,8 @@ import {
   createBrowserSupabaseClient,
   PublicSupabaseConfig,
 } from '@/lib/supabase';
+import PdfCanvasReader from '@/components/PdfCanvasReader';
+import {extractPdfCoverAndMeta} from '@/lib/pdf-client';
 
 type FilterOption = 'All' | BookCategory | BookAccessType;
 type AuthModalMode = 'login' | 'signup' | 'publish';
@@ -63,6 +71,11 @@ const LOCAL_BOOKS_KEY = 'wbr_local_books_v1';
 const AVATAR_CACHE_PREFIX = 'wbr_avatar_v1_';
 const BOOK_COVER_CACHE_PREFIX = 'wbr_book_cover_v1_';
 const BOOK_FILE_CACHE_PREFIX = 'wbr_book_file_v1_';
+const READER_PREFS_KEY = 'wbr_reader_prefs_v1';
+const READING_PROGRESS_KEY = 'wbr_reading_progress_v1';
+const UNLOCKED_BOOKS_KEY = 'wbr_unlocked_books_v1';
+
+type ReaderTheme = 'dark' | 'sepia' | 'light';
 
 const BLOCKED_MEDIA_EXTENSIONS = new Set([
   'jpg',
@@ -125,6 +138,20 @@ function isPdfBookFile(fileName?: string, fileUrl?: string): boolean {
   return Boolean(
     fileName?.toLowerCase().endsWith('.pdf') ||
       fileUrl?.toLowerCase().startsWith('data:application/pdf'),
+  );
+}
+
+function isReadableTextBookFile(fileName?: string, fileUrl?: string): boolean {
+  const nameLower = (fileName || '').toLowerCase();
+  const urlLower = (fileUrl || '').toLowerCase();
+  return Boolean(
+    nameLower.endsWith('.txt') ||
+      nameLower.endsWith('.md') ||
+      nameLower.endsWith('.markdown') ||
+      nameLower.endsWith('.csv') ||
+      nameLower.endsWith('.json') ||
+      nameLower.endsWith('.log') ||
+      urlLower.startsWith('data:text/'),
   );
 }
 
@@ -410,16 +437,26 @@ export default function WorldBookRecords({
   );
   const [bookTitleInput, setBookTitleInput] = useState('');
   const [bookDescriptionInput, setBookDescriptionInput] = useState('');
+  const [bookContentInput, setBookContentInput] = useState('');
   const [bookCoverDraft, setBookCoverDraft] = useState<string>('');
   const [bookCoverMeta, setBookCoverMeta] = useState<string>('');
   const [bookCoverErrors, setBookCoverErrors] = useState<Record<string, boolean>>({});
   const [bookFileDraft, setBookFileDraft] = useState<string>('');
   const [bookFileNameDraft, setBookFileNameDraft] = useState<string>('');
   const [bookFileSizeDraft, setBookFileSizeDraft] = useState<string>('');
+  const [bookPdfPagesDraft, setBookPdfPagesDraft] = useState<number | null>(null);
+  const [editingBook, setEditingBook] = useState<BookItem | null>(null);
+  const [deleteConfirmBookId, setDeleteConfirmBookId] = useState<string | null>(null);
+  const [deletingBookId, setDeletingBookId] = useState<string | null>(null);
   const [pdfPreviewOpen, setPdfPreviewOpen] = useState(false);
-  const [pdfPreviewBlobUrl, setPdfPreviewBlobUrl] = useState<{
+  const [readerBook, setReaderBook] = useState<BookItem | null>(null);
+  const [readerTheme, setReaderTheme] = useState<ReaderTheme>('dark');
+  const [readerFontSize, setReaderFontSize] = useState<number>(18);
+  const [readingProgress, setReadingProgress] = useState<Record<string, number>>({});
+  const [unlockedBookIds, setUnlockedBookIds] = useState<Record<string, boolean>>({});
+  const [readerTextContent, setReaderTextContent] = useState<{
     bookId: string;
-    url: string;
+    text: string;
   } | null>(null);
   const [bookCategoryInput, setBookCategoryInput] = useState<BookCategory>('Fiction');
   const [bookAccessInput, setBookAccessInput] = useState<BookAccessType>('Free');
@@ -433,6 +470,7 @@ export default function WorldBookRecords({
   const profileFileInputRef = useRef<HTMLInputElement | null>(null);
   const bookCoverFileInputRef = useRef<HTMLInputElement | null>(null);
   const bookFileInputRef = useRef<HTMLInputElement | null>(null);
+  const readerScrollRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -441,6 +479,7 @@ export default function WorldBookRecords({
         setProfileModalOpen(false);
         setPdfPreviewOpen(false);
         setSelectedBook(null);
+        setReaderBook(null);
         setAuthorsDirectoryOpen(false);
         setSelectedInfoPage(null);
         setMobileMenuOpen(false);
@@ -451,49 +490,75 @@ export default function WorldBookRecords({
   }, []);
 
   useEffect(() => {
-    if (
-      !pdfPreviewOpen ||
-      !selectedBook?.bookFileUrl ||
-      !selectedBook.bookFileUrl.startsWith('data:')
-    ) {
-      return;
-    }
+    let active = true;
+    Promise.resolve().then(() => {
+      if (!active) return;
+      const savedPrefs = readLocalJson<{theme?: ReaderTheme; fontSize?: number}>(
+        READER_PREFS_KEY,
+        {},
+      );
+      if (savedPrefs.theme) setReaderTheme(savedPrefs.theme);
+      if (
+        typeof savedPrefs.fontSize === 'number' &&
+        savedPrefs.fontSize >= 15 &&
+        savedPrefs.fontSize <= 24
+      ) {
+        setReaderFontSize(savedPrefs.fontSize);
+      }
+      const savedProgress = readLocalJson<Record<string, number>>(
+        READING_PROGRESS_KEY,
+        {},
+      );
+      if (Object.keys(savedProgress).length > 0) {
+        setReadingProgress(savedProgress);
+      }
+      const savedUnlocked = readLocalJson<Record<string, boolean>>(
+        UNLOCKED_BOOKS_KEY,
+        {},
+      );
+      if (Object.keys(savedUnlocked).length > 0) {
+        setUnlockedBookIds(savedUnlocked);
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
 
+  useEffect(() => {
+    if (!readerBook?.bookFileUrl) return;
+    const bookId = readerBook.id;
+    const fileName = readerBook.bookFileName;
+    const sourceUrl = readerBook.bookFileUrl;
     let revoked = false;
-    let objectUrl: string | null = null;
-    const bookId = selectedBook.id;
-    const sourceUrl = selectedBook.bookFileUrl;
 
-    fetch(sourceUrl)
-      .then((res) => res.blob())
-      .then((blob) => {
-        if (revoked) return;
-        const pdfBlob =
-          blob.type === 'application/pdf'
-            ? blob
-            : new Blob([blob], {type: 'application/pdf'});
-        objectUrl = URL.createObjectURL(pdfBlob);
-        setPdfPreviewBlobUrl({bookId, url: objectUrl});
-      })
-      .catch(() => {
-        if (!revoked) setPdfPreviewBlobUrl({bookId, url: sourceUrl});
-      });
+    if (isReadableTextBookFile(fileName, sourceUrl)) {
+      fetch(sourceUrl)
+        .then((res) => res.text())
+        .then((text) => {
+          if (!revoked) setReaderTextContent({bookId, text});
+        })
+        .catch(() => {
+          // Fallback to excerpt text
+        });
+    }
 
     return () => {
       revoked = true;
-      if (objectUrl) {
-        URL.revokeObjectURL(objectUrl);
-      }
     };
-  }, [pdfPreviewOpen, selectedBook]);
+  }, [readerBook]);
 
-  const activePdfUrl =
-    pdfPreviewOpen && selectedBook?.bookFileUrl
-      ? selectedBook.bookFileUrl.startsWith('data:')
-        ? pdfPreviewBlobUrl?.bookId === selectedBook.id
-          ? pdfPreviewBlobUrl.url
-          : null
-        : selectedBook.bookFileUrl
+  const activeReaderPdfSource =
+    readerBook?.bookFileUrl &&
+    isPdfBookFile(readerBook.bookFileName, readerBook.bookFileUrl)
+      ? readerBook.bookFileUrl
+      : null;
+
+  const activeReaderFileText =
+    readerBook?.bookFileUrl &&
+    isReadableTextBookFile(readerBook.bookFileName, readerBook.bookFileUrl) &&
+    readerTextContent?.bookId === readerBook.id
+      ? readerTextContent.text
       : null;
 
   useEffect(() => {
@@ -727,12 +792,110 @@ export default function WorldBookRecords({
     });
   }, [books, searchQuery, activeFilter]);
 
+  const resetBookForm = () => {
+    setEditingBook(null);
+    setBookTitleInput('');
+    setBookDescriptionInput('');
+    setBookContentInput('');
+    setBookCoverDraft('');
+    setBookCoverMeta('');
+    setBookFileDraft('');
+    setBookFileNameDraft('');
+    setBookFileSizeDraft('');
+    setBookPdfPagesDraft(null);
+    setBookCategoryInput('Fiction');
+    setBookAccessInput('Free');
+    setBookPriceInput('$4.99');
+  };
+
   const openAuthModal = (mode: AuthModalMode) => {
     setFormError(null);
+    if (mode === 'publish') {
+      resetBookForm();
+      setAccountType('Author account');
+    }
     setAuthModalMode(mode);
     setMobileMenuOpen(false);
-    if (mode === 'publish') {
-      setAccountType('Author account');
+  };
+
+  const openEditBookModal = (book: BookItem) => {
+    setFormError(null);
+    setEditingBook(book);
+    setBookTitleInput(book.title);
+    setBookDescriptionInput(book.synopsis);
+    setBookContentInput(book.excerpt === book.synopsis ? '' : book.excerpt);
+    setBookCoverDraft(book.coverImageUrl || '');
+    setBookCoverMeta(
+      book.coverImageUrl ? 'Current cover photo (keep or replace)' : '',
+    );
+    setBookFileDraft(book.bookFileUrl || '');
+    setBookFileNameDraft(book.bookFileName || '');
+    setBookFileSizeDraft(book.bookFileSize || '');
+    setBookPdfPagesDraft(book.pages || null);
+    setBookCategoryInput(book.category);
+    setBookAccessInput(book.type);
+    setBookPriceInput(book.type === 'Paid' ? book.priceLabel : '$4.99');
+    setProfileModalOpen(false);
+    setSelectedBook(null);
+    setAuthModalMode('publish');
+  };
+
+  const isOwnedByCurrentUser = (book: BookItem): boolean => {
+    if (!signedInUser) return false;
+    if (book.userId && book.userId === signedInUser.id) return true;
+    return (
+      book.author.trim().toLowerCase() === signedInUser.name.trim().toLowerCase()
+    );
+  };
+
+  const handleDeleteBook = async (book: BookItem) => {
+    setDeletingBookId(book.id);
+    try {
+      if (supabaseClient) {
+        const {data: deletedRows, error: deleteError} = await supabaseClient
+          .from('books')
+          .delete()
+          .eq('id', book.id)
+          .select('id');
+
+        if (deleteError) {
+          setFeedbackBanner(`Could not delete "${book.title}": ${deleteError.message}`);
+          return;
+        }
+        if (!deletedRows || deletedRows.length === 0) {
+          setFeedbackBanner(
+            `Could not delete "${book.title}". Make sure you are signed in with the account that published this book.`,
+          );
+          return;
+        }
+      }
+
+      try {
+        window.localStorage.removeItem(`${BOOK_COVER_CACHE_PREFIX}${book.id}`);
+        window.localStorage.removeItem(`${BOOK_FILE_CACHE_PREFIX}${book.id}`);
+      } catch {
+        // Ignore storage errors
+      }
+
+      const existingLocalBooks = readLocalJson<BookItem[]>(LOCAL_BOOKS_KEY, []);
+      if (existingLocalBooks.some((b) => b.id === book.id)) {
+        writeLocalJson(
+          LOCAL_BOOKS_KEY,
+          existingLocalBooks.filter((b) => b.id !== book.id),
+        );
+      }
+
+      setBooks((prev) => prev.filter((b) => b.id !== book.id));
+      if (selectedBook?.id === book.id) {
+        setSelectedBook(null);
+      }
+      if (readerBook?.id === book.id) {
+        setReaderBook(null);
+      }
+      setDeleteConfirmBookId(null);
+      setFeedbackBanner(`Deleted "${book.title}".`);
+    } finally {
+      setDeletingBookId(null);
     }
   };
 
@@ -798,7 +961,23 @@ export default function WorldBookRecords({
       setBookFileDraft(dataUrl);
       setBookFileNameDraft(file.name);
       setBookFileSizeDraft(formatFileSize(file.size));
+      setBookPdfPagesDraft(null);
       setFormError(null);
+
+      if (isPdfBookFile(file.name, dataUrl)) {
+        const pdfMeta = await extractPdfCoverAndMeta(dataUrl);
+        if (pdfMeta) {
+          setBookPdfPagesDraft(pdfMeta.numPages);
+          if (!bookCoverDraft && pdfMeta.coverDataUrl) {
+            setBookCoverDraft(pdfMeta.coverDataUrl);
+            setBookCoverMeta(
+              `Auto-captured from PDF Page 1 · ${pdfMeta.numPages} ${
+                pdfMeta.numPages === 1 ? 'page' : 'pages'
+              }`,
+            );
+          }
+        }
+      }
     } catch {
       setFormError('Could not read that book file. Please try another file.');
     }
@@ -1077,12 +1256,133 @@ export default function WorldBookRecords({
           const line1 = words.slice(0, splitIdx).join(' ');
           const line2 = words.slice(splitIdx).join(' ') || 'Edition';
           const variants: BookCoverVariant[] = ['c1', 'c2', 'c3', 'c4'];
-          const variant = variants[books.length % variants.length];
+          const variant = editingBook
+            ? editingBook.coverVariant
+            : variants[books.length % variants.length];
           const priceLabel =
             bookAccessInput === 'Free' ? 'Free' : bookPriceInput.trim() || '$4.99';
-          const newId = `book-${Date.now()}`;
           const descriptionText = bookDescriptionInput.trim();
+          const readingText = bookContentInput.trim() || descriptionText;
+          const computedPages =
+            bookPdfPagesDraft ||
+            Math.max(12, Math.ceil(readingText.split(/\s+/).length / 180) * 12 || 210);
 
+          if (editingBook) {
+            const updateBase = {
+              title: bookTitleInput.trim(),
+              title_line_1: line1,
+              title_line_2: line2,
+              category: bookCategoryInput,
+              access_type: bookAccessInput,
+              price_label: priceLabel,
+              pages: computedPages,
+              synopsis: descriptionText,
+              excerpt: readingText,
+            };
+
+            let {data: updatedRow, error: updateError} = await supabaseClient
+              .from('books')
+              .update({
+                ...updateBase,
+                cover_image_url: bookCoverDraft || null,
+                book_file_url: bookFileDraft || null,
+                book_file_name: bookFileNameDraft || null,
+                book_file_size: bookFileSizeDraft || null,
+              })
+              .eq('id', editingBook.id)
+              .select()
+              .single();
+
+            let strippedOptionalColumn = false;
+            if (
+              updateError &&
+              (updateError.message.toLowerCase().includes('cover_image_url') ||
+                updateError.message.toLowerCase().includes('book_file_'))
+            ) {
+              strippedOptionalColumn = true;
+              const retryPayload: Record<string, unknown> = {...updateBase};
+              const errLower = updateError.message.toLowerCase();
+              if (!errLower.includes('cover_image_url')) {
+                retryPayload.cover_image_url = bookCoverDraft || null;
+              }
+              const retryRes = await supabaseClient
+                .from('books')
+                .update(retryPayload)
+                .eq('id', editingBook.id)
+                .select()
+                .single();
+              updatedRow = retryRes.data;
+              updateError = retryRes.error;
+            }
+
+            if (updateError) {
+              setFormError(updateError.message);
+              setSubmitting(false);
+              return;
+            }
+            if (!updatedRow) {
+              setFormError(
+                'Could not update this book. Make sure you are signed in with the account that published it.',
+              );
+              setSubmitting(false);
+              return;
+            }
+
+            try {
+              if (bookCoverDraft) {
+                window.localStorage.setItem(
+                  `${BOOK_COVER_CACHE_PREFIX}${editingBook.id}`,
+                  bookCoverDraft,
+                );
+              } else {
+                window.localStorage.removeItem(
+                  `${BOOK_COVER_CACHE_PREFIX}${editingBook.id}`,
+                );
+              }
+              if (bookFileDraft && bookFileDraft.length <= 2_500_000) {
+                window.localStorage.setItem(
+                  `${BOOK_FILE_CACHE_PREFIX}${editingBook.id}`,
+                  JSON.stringify({
+                    url: bookFileDraft,
+                    name: bookFileNameDraft,
+                    size: bookFileSizeDraft,
+                  }),
+                );
+              } else if (!bookFileDraft) {
+                window.localStorage.removeItem(
+                  `${BOOK_FILE_CACHE_PREFIX}${editingBook.id}`,
+                );
+              }
+            } catch {
+              // Ignore localStorage quota errors
+            }
+
+            const mapped = mapDbBook(updatedRow as DbBookRow);
+            if (bookCoverDraft && !mapped.coverImageUrl) {
+              mapped.coverImageUrl = bookCoverDraft;
+            }
+            if (bookFileDraft && !mapped.bookFileUrl) {
+              mapped.bookFileUrl = bookFileDraft;
+              mapped.bookFileName = bookFileNameDraft;
+              mapped.bookFileSize = bookFileSizeDraft;
+            }
+            setBooks((prev) =>
+              prev.map((b) => (b.id === editingBook.id ? mapped : b)),
+            );
+            setFeedbackBanner(
+              strippedOptionalColumn
+                ? `Updated "${mapped.title}", but run the ALTER TABLE SQL in Supabase so everyone sees attached files.`
+                : `Updated "${mapped.title}".`,
+            );
+            resetBookForm();
+            setAuthModalMode(null);
+            setPassword('');
+            scrollToProfile();
+            setSubmitting(false);
+            return;
+          }
+
+          const newId = `book-${Date.now()}`;
           const basePayload = {
             id: newId,
             user_id: activeUserId,
@@ -1096,10 +1396,10 @@ export default function WorldBookRecords({
             cover_variant: variant,
             cover_kicker: 'WORLD BOOK RECORDS',
             cover_footer: `BY ${displayName.toUpperCase()}`,
-            pages: 210,
+            pages: computedPages,
             published_year: 2026,
             synopsis: descriptionText,
-            excerpt: descriptionText,
+            excerpt: readingText,
           };
 
           let {data: insertedBook, error: insertError} = await supabaseClient
@@ -1210,13 +1510,7 @@ export default function WorldBookRecords({
               ? `"${bookTitleInput.trim()}" published, but run the ALTER TABLE SQL in Supabase so everyone can see the attached file.`
               : `"${bookTitleInput.trim()}" has been published to World Book Records.`,
           );
-          setBookTitleInput('');
-          setBookDescriptionInput('');
-          setBookCoverDraft('');
-          setBookCoverMeta('');
-          setBookFileDraft('');
-          setBookFileNameDraft('');
-          setBookFileSizeDraft('');
+          resetBookForm();
           setAuthModalMode(null);
           setPassword('');
           scrollToProfile();
@@ -1352,10 +1646,53 @@ export default function WorldBookRecords({
         const line1 = words.slice(0, splitIdx).join(' ');
         const line2 = words.slice(splitIdx).join(' ') || 'Edition';
         const variants: BookCoverVariant[] = ['c1', 'c2', 'c3', 'c4'];
-        const variant = variants[books.length % variants.length];
+        const variant = editingBook
+          ? editingBook.coverVariant
+          : variants[books.length % variants.length];
         const priceLabel =
           bookAccessInput === 'Free' ? 'Free' : bookPriceInput.trim() || '$4.99';
         const descriptionText = bookDescriptionInput.trim();
+        const readingText = bookContentInput.trim() || descriptionText;
+        const computedPages =
+          bookPdfPagesDraft ||
+          Math.max(12, Math.ceil(readingText.split(/\s+/).length / 180) * 12 || 210);
+
+        if (editingBook) {
+          const updatedBook: BookItem = {
+            ...editingBook,
+            titleLines: [line1, line2],
+            title: bookTitleInput.trim(),
+            category: bookCategoryInput,
+            type: bookAccessInput,
+            priceLabel,
+            coverImageUrl: bookCoverDraft || undefined,
+            bookFileUrl: bookFileDraft || undefined,
+            bookFileName: bookFileNameDraft || undefined,
+            bookFileSize: bookFileSizeDraft || undefined,
+            pages: computedPages,
+            synopsis: descriptionText,
+            excerpt: readingText,
+          };
+
+          const existingLocalBooks = readLocalJson<BookItem[]>(LOCAL_BOOKS_KEY, []);
+          writeLocalJson(
+            LOCAL_BOOKS_KEY,
+            existingLocalBooks.some((b) => b.id === editingBook.id)
+              ? existingLocalBooks.map((b) =>
+                  b.id === editingBook.id ? updatedBook : b,
+                )
+              : [updatedBook, ...existingLocalBooks],
+          );
+          setBooks((prev) =>
+            prev.map((b) => (b.id === editingBook.id ? updatedBook : b)),
+          );
+          setFeedbackBanner(`Updated "${updatedBook.title}".`);
+          resetBookForm();
+          setAuthModalMode(null);
+          setPassword('');
+          scrollToProfile();
+          return;
+        }
 
         const newBook: BookItem = {
           id: `book-${Date.now()}`,
@@ -1373,10 +1710,10 @@ export default function WorldBookRecords({
           coverVariant: variant,
           coverKicker: 'WORLD BOOK RECORDS',
           coverFooter: `BY ${currentSession.name.toUpperCase()}`,
-          pages: 210,
+          pages: computedPages,
           publishedYear: 2026,
           synopsis: descriptionText,
-          excerpt: descriptionText,
+          excerpt: readingText,
         };
 
         const existingLocalBooks = readLocalJson<BookItem[]>(LOCAL_BOOKS_KEY, []);
@@ -1385,13 +1722,7 @@ export default function WorldBookRecords({
         setFeedbackBanner(
           `"${newBook.title}" saved in this browser only. Connect Supabase Secrets so everyone can see it.`,
         );
-        setBookTitleInput('');
-        setBookDescriptionInput('');
-        setBookCoverDraft('');
-        setBookCoverMeta('');
-        setBookFileDraft('');
-        setBookFileNameDraft('');
-        setBookFileSizeDraft('');
+        resetBookForm();
         setAuthModalMode(null);
         setPassword('');
         scrollToProfile();
@@ -1418,10 +1749,15 @@ export default function WorldBookRecords({
       title: 'Join World Book Records',
       desc: 'Create your reader or author account.',
     },
-    publish: {
-      title: 'Upload & publish a book',
-      desc: 'Add your cover photo, book title, description, and price.',
-    },
+    publish: editingBook
+      ? {
+          title: 'Update book',
+          desc: 'Edit your book cover, title, description, price, or attached file.',
+        }
+      : {
+          title: 'Upload & publish a book',
+          desc: 'Add your cover photo, book title, description, and price.',
+        },
   };
 
   return (
@@ -2317,6 +2653,51 @@ export default function WorldBookRecords({
                               {book.priceLabel}
                             </span>
                           </div>
+
+                          <div
+                            onClick={(e) => e.stopPropagation()}
+                            className="mt-3 pt-2.5 border-t border-[#24211c] flex items-center gap-1.5 flex-wrap"
+                          >
+                            {deleteConfirmBookId === book.id ? (
+                              <>
+                                <button
+                                  type="button"
+                                  disabled={deletingBookId === book.id}
+                                  onClick={() => handleDeleteBook(book)}
+                                  className="flex-1 inline-flex items-center justify-center gap-1 rounded-[7px] px-2 py-1.5 text-[11px] font-bold bg-red-600 hover:bg-red-500 text-white border-0 cursor-pointer disabled:opacity-60 transition-colors"
+                                >
+                                  {deletingBookId === book.id ? 'Deleting…' : 'Confirm'}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setDeleteConfirmBookId(null)}
+                                  className="flex-1 rounded-[7px] px-2 py-1.5 text-[11px] font-semibold bg-[#17161b] border border-[#302c25] text-[#d2cec5] hover:border-[#d8b35d] cursor-pointer transition-colors"
+                                >
+                                  Cancel
+                                </button>
+                              </>
+                            ) : (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() => openEditBookModal(book)}
+                                  className="flex-1 inline-flex items-center justify-center gap-1 rounded-[7px] px-2 py-1.5 text-[11px] font-semibold bg-[#17161b] border border-[#302c25] text-[#f7f4ed] hover:border-[#d8b35d] hover:text-[#d8b35d] cursor-pointer transition-colors"
+                                >
+                                  <Pencil className="w-3 h-3" />
+                                  <span>Edit</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setDeleteConfirmBookId(book.id)}
+                                  className="inline-flex items-center justify-center gap-1 rounded-[7px] px-2.5 py-1.5 text-[11px] font-semibold bg-[#17161b] border border-[#302c25] text-red-300 hover:border-red-500/60 hover:text-red-200 cursor-pointer transition-colors"
+                                  aria-label={`Delete ${book.title}`}
+                                >
+                                  <Trash2 className="w-3 h-3" />
+                                  <span>Delete</span>
+                                </button>
+                              </>
+                            )}
+                          </div>
                         </div>
                       </article>
                     ))}
@@ -2359,7 +2740,10 @@ export default function WorldBookRecords({
             exit={{opacity: 0}}
             transition={{duration: 0.16}}
             onClick={(e) => {
-              if (e.target === e.currentTarget) setAuthModalMode(null);
+              if (e.target === e.currentTarget) {
+                setAuthModalMode(null);
+                setEditingBook(null);
+              }
             }}
             className="fixed inset-0 z-30 bg-black/75 grid place-items-center p-[18px]"
             role="dialog"
@@ -2377,7 +2761,10 @@ export default function WorldBookRecords({
             >
               <button
                 type="button"
-                onClick={() => setAuthModalMode(null)}
+                onClick={() => {
+                  setAuthModalMode(null);
+                  setEditingBook(null);
+                }}
                 aria-label="Close modal"
                 className="absolute right-[15px] top-[12px] bg-transparent border-0 text-[#aaa] hover:text-white cursor-pointer p-1"
               >
@@ -2635,10 +3022,27 @@ export default function WorldBookRecords({
                       </label>
                       <textarea
                         required
-                        rows={3}
+                        rows={2}
                         value={bookDescriptionInput}
                         onChange={(e) => setBookDescriptionInput(e.target.value)}
-                        placeholder="Write a summary or description of your book for readers..."
+                        placeholder="Write a short summary or description of your book..."
+                        className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-white outline-none resize-y text-[13.5px] leading-relaxed"
+                      />
+                    </div>
+
+                    {/* Optional Story / Full Reading Text */}
+                    <div>
+                      <label className="block text-[11px] font-bold uppercase tracking-[1.5px] text-[#d7c18e] mb-1">
+                        Book Story / Text{' '}
+                        <span className="font-normal text-[#a7a3a0] normal-case tracking-normal">
+                          (optional — readers can read directly on the site)
+                        </span>
+                      </label>
+                      <textarea
+                        rows={4}
+                        value={bookContentInput}
+                        onChange={(e) => setBookContentInput(e.target.value)}
+                        placeholder="Write or paste chapters / story text here so readers can read right inside the reader..."
                         className="w-full p-3 bg-[#0d0d0f] border border-[#302c25] focus:border-[#d8b35d] rounded-[8px] text-white outline-none resize-y text-[13.5px] leading-relaxed"
                       />
                     </div>
@@ -2765,6 +3169,7 @@ export default function WorldBookRecords({
                               setBookFileDraft('');
                               setBookFileNameDraft('');
                               setBookFileSizeDraft('');
+                              setBookPdfPagesDraft(null);
                               if (bookFileInputRef.current) {
                                 bookFileInputRef.current.value = '';
                               }
@@ -2806,14 +3211,18 @@ export default function WorldBookRecords({
                       ? 'Log in'
                       : authModalMode === 'signup'
                         ? 'Create account'
-                        : 'Upload & publish book'}
+                        : editingBook
+                          ? 'Save changes'
+                          : 'Upload & publish book'}
                 </button>
               </form>
 
               <p className="text-[11px] text-[#a99b7b] mt-3 mb-0">
                 {authModalMode === 'publish'
                   ? supabaseClient
-                    ? 'Your newly published title will appear under your profile and for all visitors in the global library.'
+                    ? editingBook
+                      ? 'Changes will immediately update across your profile and the global library.'
+                      : 'Your newly published title will appear under your profile and for all visitors in the global library.'
                     : 'Browser-only mode: Connect NEXT_PUBLIC_SUPABASE_URL & NEXT_PUBLIC_SUPABASE_ANON_KEY (sb_publishable_...) in Secrets so everyone can see your uploaded books.'
                   : authModalMode === 'login'
                     ? 'Sign in to view your photo, name, and published books.'
@@ -2954,11 +3363,16 @@ export default function WorldBookRecords({
                       ) && (
                         <button
                           type="button"
-                          onClick={() => setPdfPreviewOpen((prev) => !prev)}
+                          onClick={() => {
+                            const targetBook = selectedBook;
+                            setPdfPreviewOpen(false);
+                            setSelectedBook(null);
+                            setReaderBook(targetBook);
+                          }}
                           className="inline-flex items-center gap-1.5 border border-[#d8b35d] rounded-[8px] px-3 py-1.5 text-[12px] font-bold text-[#d8b35d] bg-transparent hover:bg-[#d8b35d]/10 cursor-pointer transition-colors"
                         >
                           <BookOpen className="w-3.5 h-3.5" />
-                          <span>{pdfPreviewOpen ? 'Hide PDF' : 'Read PDF'}</span>
+                          <span>Read PDF</span>
                         </button>
                       )}
                       <button
@@ -2971,16 +3385,6 @@ export default function WorldBookRecords({
                       </button>
                     </div>
                   </div>
-
-                  {activePdfUrl && (
-                    <div className="mt-3 rounded-[9px] overflow-hidden border border-[#302c25] bg-[#0b0b0d]">
-                      <iframe
-                        src={activePdfUrl}
-                        title={`${selectedBook.title} PDF preview`}
-                        className="w-full h-[380px] border-0"
-                      />
-                    </div>
-                  )}
                 </div>
               )}
 
@@ -2994,39 +3398,459 @@ export default function WorldBookRecords({
                 </blockquote>
               </div>
 
-              <div className="mt-5 flex items-center justify-between gap-3">
-                <span className="text-[#d8b35d] font-extrabold text-[16px] tabular-nums">
-                  {selectedBook.priceLabel}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (selectedBook.bookFileUrl) {
-                      handleDownloadBookFile(selectedBook);
-                      return;
-                    }
-                    const bookTitle = selectedBook.title;
-                    const isFree = selectedBook.type === 'Free';
-                    setPdfPreviewOpen(false);
-                    setSelectedBook(null);
-                    setFeedbackBanner(
-                      isFree
-                        ? `Opened "${bookTitle}" in your reading list.`
-                        : `Added "${bookTitle}" to your reading queue.`,
-                    );
-                  }}
-                  className="border border-[#d8b35d] rounded-[9px] px-4 py-2 text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] font-bold text-[13px] cursor-pointer transition-colors"
-                >
-                  {selectedBook.bookFileUrl
-                    ? `Download (${getFileExtensionLabel(selectedBook.bookFileName)})`
-                    : selectedBook.type === 'Free'
-                      ? 'Read for free'
-                      : 'Acquire edition'}
-                </button>
+              <div className="mt-5 flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <span className="text-[#d8b35d] font-extrabold text-[16px] tabular-nums">
+                    {selectedBook.priceLabel}
+                  </span>
+                  {readingProgress[selectedBook.id] ? (
+                    <span className="ml-2.5 text-[11px] text-[#a7a3a0]">
+                      · {readingProgress[selectedBook.id]}% read
+                    </span>
+                  ) : null}
+                </div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  {isOwnedByCurrentUser(selectedBook) && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => openEditBookModal(selectedBook)}
+                        className="inline-flex items-center gap-1.5 border border-[#302c25] hover:border-[#d8b35d] rounded-[9px] px-3 py-2 text-[#f7f4ed] bg-[#0d0d10] font-semibold text-[13px] cursor-pointer transition-colors"
+                      >
+                        <Pencil className="w-3.5 h-3.5 text-[#d8b35d]" />
+                        <span>Edit</span>
+                      </button>
+                      {deleteConfirmBookId === selectedBook.id ? (
+                        <div className="inline-flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            disabled={deletingBookId === selectedBook.id}
+                            onClick={() => handleDeleteBook(selectedBook)}
+                            className="inline-flex items-center gap-1 rounded-[9px] px-3 py-2 text-[12.5px] font-bold bg-red-600 hover:bg-red-500 text-white border-0 cursor-pointer disabled:opacity-60 transition-colors"
+                          >
+                            {deletingBookId === selectedBook.id
+                              ? 'Deleting…'
+                              : 'Confirm delete'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setDeleteConfirmBookId(null)}
+                            className="border border-[#302c25] hover:border-[#d8b35d] rounded-[9px] px-2.5 py-2 text-[#d2cec5] bg-[#0d0d10] font-semibold text-[12.5px] cursor-pointer transition-colors"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => setDeleteConfirmBookId(selectedBook.id)}
+                          className="inline-flex items-center gap-1.5 border border-[#302c25] hover:border-red-500/60 rounded-[9px] px-3 py-2 text-red-300 hover:text-red-200 bg-[#0d0d10] font-semibold text-[13px] cursor-pointer transition-colors"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          <span>Delete</span>
+                        </button>
+                      )}
+                    </>
+                  )}
+                  {selectedBook.bookFileUrl && (
+                    <button
+                      type="button"
+                      onClick={() => handleDownloadBookFile(selectedBook)}
+                      className="inline-flex items-center gap-1.5 border border-[#302c25] hover:border-[#d8b35d] rounded-[9px] px-3.5 py-2 text-[#f7f4ed] bg-[#0d0d10] font-semibold text-[13px] cursor-pointer transition-colors"
+                    >
+                      <Download className="w-3.5 h-3.5 text-[#d8b35d]" />
+                      <span>
+                        Download ({getFileExtensionLabel(selectedBook.bookFileName)})
+                      </span>
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const targetBook = selectedBook;
+                      setPdfPreviewOpen(false);
+                      setSelectedBook(null);
+                      setReaderBook(targetBook);
+                    }}
+                    className="inline-flex items-center gap-1.5 border border-[#d8b35d] rounded-[9px] px-4 py-2 text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] font-bold text-[13px] cursor-pointer transition-colors"
+                  >
+                    <BookOpen className="w-4 h-4" />
+                    <span>
+                      {selectedBook.type === 'Free' ||
+                      unlockedBookIds[selectedBook.id] ||
+                      isOwnedByCurrentUser(selectedBook)
+                        ? 'Read book'
+                        : 'Read sample'}
+                    </span>
+                  </button>
+                </div>
               </div>
             </motion.div>
           </motion.div>
         )}
+      </AnimatePresence>
+
+      {/* Full-Screen Book Reader (Full-page PDF only when reading PDF) */}
+      <AnimatePresence>
+        {readerBook &&
+          (() => {
+            const isAuthorOwner = Boolean(
+              signedInUser &&
+                (readerBook.userId === signedInUser.id ||
+                  readerBook.author.trim().toLowerCase() ===
+                    signedInUser.name.trim().toLowerCase()),
+            );
+            const hasFullAccess =
+              readerBook.type === 'Free' ||
+              isAuthorOwner ||
+              Boolean(unlockedBookIds[readerBook.id]);
+            const isFullPagePdf = Boolean(hasFullAccess && activeReaderPdfSource);
+
+            return (
+              <motion.div
+                initial={{opacity: 0}}
+                animate={{opacity: 1}}
+                exit={{opacity: 0}}
+                transition={{duration: 0.16}}
+                className={`fixed inset-0 z-40 flex flex-col ${
+                  isFullPagePdf
+                    ? 'bg-[#111114] text-[#efeadd]'
+                    : readerTheme === 'sepia'
+                      ? 'bg-[#f4ecd8] text-[#2b2118]'
+                      : readerTheme === 'light'
+                        ? 'bg-[#faf9f6] text-[#1a1a1c]'
+                        : 'bg-[#0b0b0d] text-[#efeadd]'
+                }`}
+                role="dialog"
+                aria-modal="true"
+                aria-label={`Reading ${readerBook.title}`}
+              >
+                {isFullPagePdf && activeReaderPdfSource ? (
+                  <PdfCanvasReader
+                    fileUrl={activeReaderPdfSource}
+                    title={readerBook.title}
+                    fullPage
+                    onClose={() => setReaderBook(null)}
+                    onDownload={() => handleDownloadBookFile(readerBook)}
+                    onScrollProgress={(pct) => {
+                      setReadingProgress((prev) => {
+                        if (prev[readerBook.id] === pct) return prev;
+                        const next = {...prev, [readerBook.id]: pct};
+                        writeLocalJson(READING_PROGRESS_KEY, next);
+                        return next;
+                      });
+                    }}
+                  />
+                ) : (
+                  <>
+                    {/* Reader Top Controls Bar */}
+                    <div
+                      className={`border-b px-4 sm:px-6 py-3 flex items-center justify-between gap-3 flex-wrap ${
+                        readerTheme === 'sepia'
+                          ? 'border-[#dfd2b5] bg-[#ede2c8]'
+                          : readerTheme === 'light'
+                            ? 'border-[#e5e2dc] bg-[#ffffff]'
+                            : 'border-[#2b2720] bg-[#121215]'
+                      }`}
+                    >
+                      <div className="flex items-center gap-3 min-w-0">
+                        <button
+                          type="button"
+                          onClick={() => setReaderBook(null)}
+                          className={`inline-flex items-center gap-1.5 rounded-[8px] px-3 py-1.5 text-[12.5px] font-semibold border cursor-pointer transition-colors shrink-0 ${
+                            readerTheme === 'dark'
+                              ? 'border-[#3a3326] text-[#f7f4ed] hover:border-[#d8b35d]'
+                              : 'border-[#c8bba0] text-inherit hover:border-[#9e7d32]'
+                          }`}
+                        >
+                          <ArrowLeft className="w-4 h-4" />
+                          <span>Back</span>
+                        </button>
+                        <div className="min-w-0">
+                          <div className="font-serif text-[16px] sm:text-[18px] truncate font-medium">
+                            {readerBook.title}
+                          </div>
+                          <div className="text-[11.5px] opacity-75 truncate">
+                            by {readerBook.author} · {readerBook.category} ·{' '}
+                            <span className="tabular-nums">
+                              {readingProgress[readerBook.id] || 0}% read
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-2 flex-wrap">
+                        {/* Font Size Controls */}
+                        <div
+                          className={`inline-flex items-center rounded-[8px] border overflow-hidden ${
+                            readerTheme === 'dark' ? 'border-[#3a3326]' : 'border-[#c8bba0]'
+                          }`}
+                        >
+                          <button
+                            type="button"
+                            aria-label="Decrease text size"
+                            onClick={() => {
+                              const next = Math.max(15, readerFontSize - 1);
+                              setReaderFontSize(next);
+                              writeLocalJson(READER_PREFS_KEY, {
+                                theme: readerTheme,
+                                fontSize: next,
+                              });
+                            }}
+                            className="px-2.5 py-1.5 hover:bg-[#d8b35d]/20 cursor-pointer bg-transparent border-0 text-inherit"
+                          >
+                            <Minus className="w-3.5 h-3.5" />
+                          </button>
+                          <span className="px-2 text-[11px] font-bold tabular-nums opacity-85">
+                            {readerFontSize}px
+                          </span>
+                          <button
+                            type="button"
+                            aria-label="Increase text size"
+                            onClick={() => {
+                              const next = Math.min(24, readerFontSize + 1);
+                              setReaderFontSize(next);
+                              writeLocalJson(READER_PREFS_KEY, {
+                                theme: readerTheme,
+                                fontSize: next,
+                              });
+                            }}
+                            className="px-2.5 py-1.5 hover:bg-[#d8b35d]/20 cursor-pointer bg-transparent border-0 text-inherit"
+                          >
+                            <Plus className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+
+                        {/* Paper Theme Switcher */}
+                        <div
+                          className={`inline-flex items-center rounded-[8px] border p-0.5 gap-0.5 ${
+                            readerTheme === 'dark' ? 'border-[#3a3326]' : 'border-[#c8bba0]'
+                          }`}
+                        >
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setReaderTheme('dark');
+                              writeLocalJson(READER_PREFS_KEY, {
+                                theme: 'dark',
+                                fontSize: readerFontSize,
+                              });
+                            }}
+                            title="Night mode"
+                            className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-[6px] text-[11px] font-semibold cursor-pointer border-0 transition-colors ${
+                              readerTheme === 'dark'
+                                ? 'bg-[#d8b35d] text-[#16130c]'
+                                : 'bg-transparent text-inherit opacity-75 hover:opacity-100'
+                            }`}
+                          >
+                            <Moon className="w-3 h-3" />
+                            <span className="hidden sm:inline">Night</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setReaderTheme('sepia');
+                              writeLocalJson(READER_PREFS_KEY, {
+                                theme: 'sepia',
+                                fontSize: readerFontSize,
+                              });
+                            }}
+                            title="Sepia paper mode"
+                            className={`px-2.5 py-1 rounded-[6px] text-[11px] font-semibold cursor-pointer border-0 transition-colors ${
+                              readerTheme === 'sepia'
+                                ? 'bg-[#b38734] text-[#fffaf0]'
+                                : 'bg-transparent text-inherit opacity-75 hover:opacity-100'
+                            }`}
+                          >
+                            Sepia
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setReaderTheme('light');
+                              writeLocalJson(READER_PREFS_KEY, {
+                                theme: 'light',
+                                fontSize: readerFontSize,
+                              });
+                            }}
+                            title="Day mode"
+                            className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-[6px] text-[11px] font-semibold cursor-pointer border-0 transition-colors ${
+                              readerTheme === 'light'
+                                ? 'bg-[#1f1e1c] text-white'
+                                : 'bg-transparent text-inherit opacity-75 hover:opacity-100'
+                            }`}
+                          >
+                            <Sun className="w-3 h-3" />
+                            <span className="hidden sm:inline">Day</span>
+                          </button>
+                        </div>
+
+                        {readerBook.bookFileUrl && (
+                          <button
+                            type="button"
+                            onClick={() => handleDownloadBookFile(readerBook)}
+                            className="inline-flex items-center gap-1.5 border border-[#d8b35d] rounded-[8px] px-3 py-1.5 text-[12px] font-bold text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] cursor-pointer transition-colors"
+                          >
+                            <Download className="w-3.5 h-3.5" />
+                            <span className="hidden sm:inline">Download</span>
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Thin Reading Progress Bar */}
+                    <div className="h-[3px] w-full bg-black/15 shrink-0">
+                      <div
+                        className="h-full bg-[#d8b35d] transition-all duration-150"
+                        style={{
+                          width: `${readingProgress[readerBook.id] || 0}%`,
+                        }}
+                      />
+                    </div>
+
+                    {(() => {
+                      const textSource =
+                        (hasFullAccess && activeReaderFileText) ||
+                        readerBook.excerpt ||
+                        '';
+                      const paragraphs = textSource
+                        .split(/\n\s*\n/)
+                        .map((p) => p.trim())
+                        .filter(Boolean);
+
+                      return (
+                        <div
+                  ref={readerScrollRef}
+                  onScroll={(e) => {
+                    const el = e.currentTarget;
+                    const maxScroll = el.scrollHeight - el.clientHeight;
+                    const pct =
+                      maxScroll <= 0
+                        ? 100
+                        : Math.min(
+                            100,
+                            Math.max(1, Math.round((el.scrollTop / maxScroll) * 100)),
+                          );
+                    setReadingProgress((prev) => {
+                      if (prev[readerBook.id] === pct) return prev;
+                      const next = {...prev, [readerBook.id]: pct};
+                      writeLocalJson(READING_PROGRESS_KEY, next);
+                      return next;
+                    });
+                  }}
+                  className="flex-1 overflow-y-auto px-5 sm:px-8 py-8 sm:py-12"
+                >
+                  <article className="max-w-[68ch] mx-auto">
+                    <div className="text-center pb-8 mb-8 border-b border-current/15">
+                      <div className="text-[11px] font-extrabold tracking-[2.5px] uppercase text-[#c49b3e] mb-2">
+                        {readerBook.category} · {readerBook.publishedYear}
+                      </div>
+                      <h1 className="font-serif text-[32px] sm:text-[42px] leading-[1.12] m-0 mb-2 font-normal">
+                        {readerBook.title}
+                      </h1>
+                      <p className="text-[14px] opacity-75 m-0 mb-4">
+                        by {readerBook.author}
+                      </p>
+                      <p className="text-[14.5px] opacity-85 max-w-[54ch] mx-auto leading-relaxed m-0">
+                        {readerBook.synopsis}
+                      </p>
+                    </div>
+
+                    <div
+                      className="font-serif space-y-6 leading-[1.88]"
+                      style={{fontSize: `${readerFontSize}px`}}
+                    >
+                      {paragraphs.length > 0 ? (
+                        paragraphs.map((para, idx) => (
+                          <p key={idx} className="m-0 whitespace-pre-line">
+                            {para}
+                          </p>
+                        ))
+                      ) : (
+                        <p className="m-0 opacity-80">{readerBook.synopsis}</p>
+                      )}
+                    </div>
+
+                    {hasFullAccess &&
+                      readerBook.bookFileUrl &&
+                      !isPdfBookFile(
+                        readerBook.bookFileName,
+                        readerBook.bookFileUrl,
+                      ) &&
+                      !activeReaderFileText && (
+                        <div
+                          className={`mt-10 rounded-[14px] border p-5 flex flex-wrap items-center justify-between gap-4 ${
+                            readerTheme === 'dark'
+                              ? 'bg-[#141417] border-[#3d3524]'
+                              : 'bg-black/5 border-[#c8bba0]'
+                          }`}
+                        >
+                          <div>
+                            <div className="font-bold text-[14px]">
+                              Attached Book Document:{' '}
+                              {readerBook.bookFileName || 'Book File'}
+                            </div>
+                            <div className="text-[12px] opacity-75 mt-0.5">
+                              Download the attached{' '}
+                              {getFileExtensionLabel(readerBook.bookFileName)} file to
+                              read the full formatted manuscript on your device.
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => handleDownloadBookFile(readerBook)}
+                            className="inline-flex items-center gap-1.5 border border-[#d8b35d] rounded-[9px] px-4 py-2 text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] font-bold text-[13px] cursor-pointer transition-colors"
+                          >
+                            <Download className="w-4 h-4" />
+                            <span>Download file</span>
+                          </button>
+                        </div>
+                      )}
+
+                    {!hasFullAccess && (
+                      <div
+                        className={`mt-10 rounded-[14px] border p-6 text-center ${
+                          readerTheme === 'dark'
+                            ? 'bg-[#161411] border-[#66512d]'
+                            : 'bg-[#d8b35d]/10 border-[#b38734]/50'
+                        }`}
+                      >
+                        <div className="text-[11px] font-extrabold tracking-[2px] uppercase text-[#c49b3e] mb-1">
+                          Paid Edition Preview
+                        </div>
+                        <h3 className="font-serif text-[22px] m-0 mb-2 font-normal">
+                          Continue reading “{readerBook.title}”
+                        </h3>
+                        <p className="text-[13.5px] opacity-80 max-w-[44ch] mx-auto mb-4">
+                          Unlock the full edition ({readerBook.priceLabel}) to access the
+                          complete manuscript and any attached files.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const next = {...unlockedBookIds, [readerBook.id]: true};
+                            setUnlockedBookIds(next);
+                            writeLocalJson(UNLOCKED_BOOKS_KEY, next);
+                            setFeedbackBanner(
+                              `Unlocked "${readerBook.title}" for full reading.`,
+                            );
+                          }}
+                          className="inline-flex items-center gap-2 border border-[#d8b35d] rounded-[9px] px-5 py-2.5 text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] font-bold text-[13.5px] cursor-pointer transition-colors"
+                        >
+                          <BookOpen className="w-4 h-4" />
+                          <span>Unlock &amp; Read Full Book ({readerBook.priceLabel})</span>
+                        </button>
+                      </div>
+                    )}
+                  </article>
+                </div>
+                      );
+                    })()}
+                  </>
+                )}
+              </motion.div>
+            );
+          })()}
       </AnimatePresence>
 
       {/* Author Directory Modal */}

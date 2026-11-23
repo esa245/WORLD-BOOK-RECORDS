@@ -65,7 +65,7 @@ export const INITIAL_BOOKS: BookItem[] = [
     synopsis:
       'Set across coastal archives and forgotten observatories, a cartographer uncovers an unwritten history preserved only in marginalia.',
     excerpt:
-      'In the hour before tide-fall, the stone library kept its own silence—not an absence of sound, but a patience earned over four centuries of salt and ink.',
+      'In the hour before tide-fall, the stone library kept its own silence—not an absence of sound, but a patience earned over four centuries of salt and ink.\n\nAlong the northern gallery, wooden drawers held sea charts drawn before the harbor walls existed. Their margins carried cramped notes in faded iron-gall ink: dates of eclipses, names of lost vessels, and quiet warnings from archivists who knew no king would read that far.\n\nMira traced the coastline with her sleeve pulled back from the vellum. Where the modern maps showed empty water, an older hand had inked three tiny crescents and a single word: Listen.',
   },
   {
     id: 'rivers-of-memory',
@@ -83,7 +83,7 @@ export const INITIAL_BOOKS: BookItem[] = [
     synopsis:
       'An open-access chronicle tracing delta trade routes, oral poetry, and riverine towns that shaped centuries of South Asian scholarship.',
     excerpt:
-      'Every ferry crossing carried more than timber and grain; it carried dialects, letters stitched into cloth, and songs tuned to the monsoon.',
+      'Every ferry crossing carried more than timber and grain; it carried dialects, letters stitched into cloth, and songs tuned to the monsoon.\n\nWhen the rivers shifted course each August, whole markets lifted their bamboo frames and followed the water. Yet the stories stayed anchored to names of bends and sandbars that still survive in folk couplets recited three hundred years later.\n\nTo read the delta properly is to read sideways across paper and tide alike—listening to boatmen, weavers, and village scribes who preserved history without marble monuments.',
   },
   {
     id: 'beyond-the-stars',
@@ -101,7 +101,7 @@ export const INITIAL_BOOKS: BookItem[] = [
     synopsis:
       'An accessible journey through deep-space spectroscopy, exoplanet atmospheres, and the human instruments built to listen across light-years.',
     excerpt:
-      'A single slit of starlight, split across prism glass, still holds the oldest chemistry lesson in the universe: what worlds are made of, and what they might yet host.',
+      'A single slit of starlight, split across prism glass, still holds the oldest chemistry lesson in the universe: what worlds are made of, and what they might yet host.\n\nLong before spacecraft left Earth’s gravity well, astronomers learned to weigh distant suns simply by noticing where dark hairlines interrupted a rainbow. Each missing sliver of color is an atomic fingerprint—sodium, iron, water vapor, or methane—carried faithfully across unimaginable emptiness.\n\nToday, those same dark lines tell us when light has passed through the thin blue rim of an alien sky.',
   },
   {
     id: 'garden-of-small-things',
@@ -119,7 +119,7 @@ export const INITIAL_BOOKS: BookItem[] = [
     synopsis:
       'Twelve linked short stories about botanists, letter-writers, and night-shift bakers tending quiet corners of a changing city.',
     excerpt:
-      'He labeled each clay pot not with Latin taxonomy, but with the name of the friend who had carried the cutting across town in a coat pocket.',
+      'He labeled each clay pot not with Latin taxonomy, but with the name of the friend who had carried the cutting across town in a coat pocket.\n\nThere was rosemary from Hannah’s third-floor fire escape, mint that survived two winters behind the bakery vent, and a stubborn fig sapling wrapped in Tuesday’s newspaper. By June, the narrow rooftop smelled like six different neighborhoods talking at once.\n\nNeighbors who rarely shared more than an elevator nod began arriving at dusk with empty jars, trading patience for green shoots.',
   },
 ];
 

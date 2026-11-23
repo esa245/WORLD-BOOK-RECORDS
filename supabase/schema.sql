@@ -140,7 +140,8 @@ drop policy if exists "Authors can update own books" on public.books;
 create policy "Authors can update own books"
   on public.books for update
   to authenticated
-  using (auth.uid() = user_id);
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
 
 drop policy if exists "Authors can delete own books" on public.books;
 create policy "Authors can delete own books"
