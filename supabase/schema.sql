@@ -121,6 +121,8 @@ create table if not exists public.books (
   moderation_status text not null default 'approved'
     check (moderation_status in ('pending', 'approved', 'rejected')),
   rejection_reason text,
+  views_count integer not null default 0,
+  loves_count integer not null default 0,
   created_at timestamptz not null default now()
 );
 
@@ -130,6 +132,8 @@ alter table public.books add column if not exists book_file_name text;
 alter table public.books add column if not exists book_file_size text;
 alter table public.books add column if not exists moderation_status text not null default 'approved';
 alter table public.books add column if not exists rejection_reason text;
+alter table public.books add column if not exists views_count integer not null default 0;
+alter table public.books add column if not exists loves_count integer not null default 0;
 
 create index if not exists idx_books_category on public.books(category);
 create index if not exists idx_books_access_type on public.books(access_type);
@@ -197,6 +201,42 @@ grant select on public.books, public.authors, public.literary_records to anon, a
 grant insert, update, delete on public.books to authenticated;
 grant insert, update on public.authors to authenticated;
 grant select, insert, update on public.profiles to authenticated;
+
+-- Atomic View & Love counters for all readers
+create or replace function public.increment_book_view(p_book_id text)
+returns table(views_count integer, loves_count integer)
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  return query
+  update public.books
+  set views_count = coalesce(public.books.views_count, 0) + 1
+  where id = p_book_id
+  returning public.books.views_count, public.books.loves_count;
+end;
+$$;
+
+create or replace function public.toggle_book_love(p_book_id text, p_delta integer)
+returns table(views_count integer, loves_count integer)
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  safe_delta integer := case when p_delta >= 1 then 1 else -1 end;
+begin
+  return query
+  update public.books
+  set loves_count = greatest(0, coalesce(public.books.loves_count, 0) + safe_delta)
+  where id = p_book_id
+  returning public.books.views_count, public.books.loves_count;
+end;
+$$;
+
+grant execute on function public.increment_book_view(text) to anon, authenticated;
+grant execute on function public.toggle_book_love(text, integer) to anon, authenticated;
 
 -- Enable live updates for newly published books (safe if already enabled)
 do $$

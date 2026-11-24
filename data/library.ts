@@ -25,6 +25,8 @@ export interface BookItem {
   excerpt: string;
   status?: BookModerationStatus;
   rejectionReason?: string;
+  viewsCount?: number;
+  lovesCount?: number;
 }
 
 export interface AuthorItem {

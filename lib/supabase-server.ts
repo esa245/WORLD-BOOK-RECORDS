@@ -16,7 +16,7 @@ import {
   isValidBrowserSupabaseKey,
   PublicSupabaseConfig,
 } from '@/lib/supabase';
-import {getModerationMap} from '@/lib/admin-store';
+import {getEngagementMap, getModerationMap} from '@/lib/admin-store';
 import type {BookModerationStatus} from '@/data/library';
 
 interface DbBookRow {
@@ -42,6 +42,8 @@ interface DbBookRow {
   excerpt: string;
   moderation_status?: BookModerationStatus | null;
   rejection_reason?: string | null;
+  views_count?: number | null;
+  loves_count?: number | null;
 }
 
 interface DbAuthorRow {
@@ -128,10 +130,12 @@ export async function loadInitialLibraryFromServer(): Promise<{
     ]);
 
     const moderationMap = getModerationMap();
+    const engagementMap = getEngagementMap();
 
     const books: BookItem[] = !booksRes.error && booksRes.data
       ? (booksRes.data as DbBookRow[]).map((row) => {
           const storeMod = moderationMap[row.id];
+          const storeEng = engagementMap[row.id];
           const status: BookModerationStatus =
             row.moderation_status || storeMod?.status || 'approved';
           const rejectionReason =
@@ -158,17 +162,20 @@ export async function loadInitialLibraryFromServer(): Promise<{
             excerpt: row.excerpt,
             status,
             rejectionReason,
+            viewsCount: Math.max(row.views_count || 0, storeEng?.views || 0),
+            lovesCount: Math.max(row.loves_count || 0, storeEng?.loves || 0),
           };
         })
       : INITIAL_BOOKS.map((book) => {
           const storeMod = moderationMap[book.id];
-          return storeMod
-            ? {
-                ...book,
-                status: storeMod.status,
-                rejectionReason: storeMod.rejectionReason,
-              }
-            : {...book, status: 'approved'};
+          const storeEng = engagementMap[book.id];
+          return {
+            ...book,
+            status: storeMod?.status || 'approved',
+            rejectionReason: storeMod?.rejectionReason,
+            viewsCount: storeEng?.views || 0,
+            lovesCount: storeEng?.loves || 0,
+          };
         });
 
     const authors: AuthorItem[] = !authorsRes.error && authorsRes.data

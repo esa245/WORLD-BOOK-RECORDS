@@ -22,9 +22,12 @@ interface PdfCanvasReaderProps {
   theme?: 'dark' | 'sepia' | 'light';
   compact?: boolean;
   fullPage?: boolean;
+  hideToolbar?: boolean;
+  controlledZoom?: number;
   onClose?: () => void;
   onScrollProgress?: (pct: number) => void;
   onPageCount?: (count: number) => void;
+  onPageChange?: (page: number, total: number) => void;
   onDownload?: () => void;
 }
 
@@ -167,21 +170,28 @@ export default function PdfCanvasReader({
   theme = 'dark',
   compact = false,
   fullPage = false,
+  hideToolbar = false,
+  controlledZoom,
   onClose,
   onScrollProgress,
   onPageCount,
+  onPageChange,
   onDownload,
 }: PdfCanvasReaderProps) {
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const onPageCountRef = useRef(onPageCount);
+  const onPageChangeRef = useRef(onPageChange);
   useEffect(() => {
     onPageCountRef.current = onPageCount;
-  }, [onPageCount]);
+    onPageChangeRef.current = onPageChange;
+  }, [onPageCount, onPageChange]);
 
   const [containerWidth, setContainerWidth] = useState<number>(
     fullPage ? 960 : compact ? 540 : 780,
   );
   const [zoom, setZoom] = useState<number>(1);
+  const activeZoom =
+    typeof controlledZoom === 'number' ? controlledZoom : zoom;
   const [currentPage, setCurrentPage] = useState<number>(1);
   const [loadState, setLoadState] = useState<{
     sourceUrl: string;
@@ -230,6 +240,7 @@ export default function PdfCanvasReader({
         });
         setCurrentPage(1);
         onPageCountRef.current?.(doc.numPages);
+        onPageChangeRef.current?.(1, doc.numPages);
       })
       .catch(() => {
         if (!active) return;
@@ -260,12 +271,12 @@ export default function PdfCanvasReader({
     [numPages],
   );
 
-  const pageTargetWidth = Math.round(containerWidth * zoom);
+  const pageTargetWidth = Math.round(containerWidth * activeZoom);
 
   return (
-    <div className="relative flex flex-col h-full w-full overflow-hidden">
-      {/* Minimal floating corner controls in Full-Page PDF mode; regular toolbar otherwise */}
-      {fullPage ? (
+    <div className="relative flex flex-col flex-1 min-h-0 h-full w-full overflow-hidden">
+      {/* Minimal floating corner controls in standalone Full-Page PDF mode; regular toolbar when standalone */}
+      {!hideToolbar && (fullPage ? (
         <>
           {onClose && (
             <button
@@ -385,7 +396,7 @@ export default function PdfCanvasReader({
             </button>
           </div>
         </div>
-      )}
+      ))}
 
       {/* Scrollable Rendered Pages */}
       <div
@@ -414,18 +425,17 @@ export default function PdfCanvasReader({
               ),
             );
             setCurrentPage(approxPage);
+            onPageChangeRef.current?.(approxPage, numPages);
           }
         }}
-        className={`flex-1 overflow-y-auto overflow-x-auto touch-pan-x touch-pan-y touch-pinch-zoom ${
-          fullPage ? 'p-0 space-y-2' : 'p-3 sm:p-5 space-y-5'
+        className={`flex-1 overflow-y-auto overflow-x-auto overscroll-contain touch-pan-x touch-pan-y touch-pinch-zoom ${
+          fullPage ? 'p-0 sm:py-3 space-y-1.5 sm:space-y-3' : 'p-3 sm:p-5 space-y-5'
         } ${compact ? 'max-h-[430px]' : ''} ${
-          fullPage
-            ? 'bg-[#111114]'
-            : theme === 'dark'
-              ? 'bg-[#0b0b0d]'
-              : theme === 'sepia'
-                ? 'bg-[#e7dbc0]'
-                : 'bg-[#e8e6e1]'
+          theme === 'dark'
+            ? 'bg-[#0b0b0d]'
+            : theme === 'sepia'
+              ? 'bg-[#f4ecd8]'
+              : 'bg-[#faf9f6]'
         }`}
       >
         {isLoading && (

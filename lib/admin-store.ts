@@ -23,10 +23,16 @@ export interface RegisteredUserSummary {
   booksCount?: number;
 }
 
+export interface BookEngagementRecord {
+  views: number;
+  loves: number;
+}
+
 interface AdminStoreData {
   adminPasswordHash?: string;
   moderation: Record<string, BookModerationRecord>;
   users: Record<string, RegisteredUserSummary>;
+  engagement: Record<string, BookEngagementRecord>;
 }
 
 const STORE_PATH = path.join(os.tmpdir(), 'wbr-admin-store-v1.json');
@@ -58,7 +64,7 @@ function readStore(): AdminStoreData {
     return globalForAdmin.__wbrAdminStore;
   }
 
-  let loaded: AdminStoreData = {moderation: {}, users: {}};
+  let loaded: AdminStoreData = {moderation: {}, users: {}, engagement: {}};
   try {
     if (fs.existsSync(STORE_PATH)) {
       const raw = fs.readFileSync(STORE_PATH, 'utf8');
@@ -67,10 +73,11 @@ function readStore(): AdminStoreData {
         adminPasswordHash: parsed.adminPasswordHash,
         moderation: parsed.moderation || {},
         users: parsed.users || {},
+        engagement: parsed.engagement || {},
       };
     }
   } catch {
-    loaded = {moderation: {}, users: {}};
+    loaded = {moderation: {}, users: {}, engagement: {}};
   }
 
   globalForAdmin.__wbrAdminStore = loaded;
@@ -319,4 +326,35 @@ export function getStoredUsers(): RegisteredUserSummary[] {
   return Object.values(readStore().users).sort((a, b) =>
     b.createdAt.localeCompare(a.createdAt),
   );
+}
+
+export function getEngagementMap(): Record<string, BookEngagementRecord> {
+  return {...readStore().engagement};
+}
+
+export function incrementBookViewInStore(bookId: string): BookEngagementRecord {
+  const store = readStore();
+  const prev = store.engagement[bookId] || {views: 0, loves: 0};
+  const next: BookEngagementRecord = {
+    views: prev.views + 1,
+    loves: prev.loves,
+  };
+  store.engagement[bookId] = next;
+  writeStore(store);
+  return next;
+}
+
+export function adjustBookLoveInStore(
+  bookId: string,
+  delta: 1 | -1,
+): BookEngagementRecord {
+  const store = readStore();
+  const prev = store.engagement[bookId] || {views: 0, loves: 0};
+  const next: BookEngagementRecord = {
+    views: prev.views,
+    loves: Math.max(0, prev.loves + delta),
+  };
+  store.engagement[bookId] = next;
+  writeStore(store);
+  return next;
 }

@@ -12,7 +12,9 @@ import {
   CheckCircle2,
   Clock,
   Download,
+  Eye,
   FileText,
+  Heart,
   ImagePlus,
   Menu,
   Minus,
@@ -80,6 +82,7 @@ const BOOK_FILE_CACHE_PREFIX = 'wbr_book_file_v1_';
 const READER_PREFS_KEY = 'wbr_reader_prefs_v1';
 const READING_PROGRESS_KEY = 'wbr_reading_progress_v1';
 const UNLOCKED_BOOKS_KEY = 'wbr_unlocked_books_v1';
+const LOVED_BOOKS_KEY = 'wbr_loved_books_v1';
 
 type ReaderTheme = 'dark' | 'sepia' | 'light';
 
@@ -209,6 +212,8 @@ interface DbBookRow {
   excerpt: string;
   moderation_status?: BookModerationStatus | null;
   rejection_reason?: string | null;
+  views_count?: number | null;
+  loves_count?: number | null;
 }
 
 interface DbAuthorRow {
@@ -274,6 +279,8 @@ function mapDbBook(row: DbBookRow): BookItem {
     excerpt: row.excerpt,
     status: row.moderation_status || 'approved',
     rejectionReason: row.rejection_reason || undefined,
+    viewsCount: typeof row.views_count === 'number' ? row.views_count : 0,
+    lovesCount: typeof row.loves_count === 'number' ? row.loves_count : 0,
   };
 }
 
@@ -462,6 +469,12 @@ export default function WorldBookRecords({
   const [readerBook, setReaderBook] = useState<BookItem | null>(null);
   const [readerTheme, setReaderTheme] = useState<ReaderTheme>('dark');
   const [readerFontSize, setReaderFontSize] = useState<number>(18);
+  const [readerPdfZoom, setReaderPdfZoom] = useState<number>(1);
+  const [readerPdfPageInfo, setReaderPdfPageInfo] = useState<{
+    bookId: string;
+    page: number;
+    total: number;
+  } | null>(null);
   const [readingProgress, setReadingProgress] = useState<Record<string, number>>({});
   const [unlockedBookIds, setUnlockedBookIds] = useState<Record<string, boolean>>({});
   const [readerTextContent, setReaderTextContent] = useState<{
@@ -480,6 +493,10 @@ export default function WorldBookRecords({
   const [moderationMap, setModerationMap] = useState<
     Record<string, {status: BookModerationStatus; rejectionReason?: string}>
   >({});
+  const [engagementMap, setEngagementMap] = useState<
+    Record<string, {views: number; loves: number}>
+  >({});
+  const [lovedBookIds, setLovedBookIds] = useState<Record<string, boolean>>({});
 
   const signupFileInputRef = useRef<HTMLInputElement | null>(null);
   const profileFileInputRef = useRef<HTMLInputElement | null>(null);
@@ -556,6 +573,127 @@ export default function WorldBookRecords({
     }
   };
 
+  const refreshEngagementCounts = async () => {
+    try {
+      const res = await fetch('/api/engagement', {cache: 'no-store'});
+      if (!res.ok) return;
+      const data = (await res.json()) as {
+        engagement?: Record<string, {views: number; loves: number}>;
+      };
+      if (data.engagement) {
+        setEngagementMap(data.engagement);
+      }
+    } catch {
+      // Ignore offline errors
+    }
+  };
+
+  const getBookViews = (book: BookItem): number =>
+    Math.max(book.viewsCount || 0, engagementMap[book.id]?.views ?? 0);
+
+  const getBookLoves = (book: BookItem): number => {
+    const eng = engagementMap[book.id];
+    if (eng) return Math.max(0, eng.loves);
+    return Math.max(0, book.lovesCount || 0);
+  };
+
+  const recordBookView = async (book: BookItem) => {
+    const baseViews = getBookViews(book);
+    const baseLoves = getBookLoves(book);
+    setEngagementMap((prev) => ({
+      ...prev,
+      [book.id]: {
+        views: Math.max(prev[book.id]?.views ?? 0, baseViews) + 1,
+        loves: prev[book.id]?.loves ?? baseLoves,
+      },
+    }));
+
+    try {
+      const res = await fetch('/api/engagement', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({bookId: book.id, action: 'view'}),
+      });
+      if (res.ok) {
+        const data = (await res.json()) as {views?: number; loves?: number};
+        setEngagementMap((prev) => ({
+          ...prev,
+          [book.id]: {
+            views:
+              typeof data.views === 'number'
+                ? Math.max(data.views, prev[book.id]?.views ?? 0)
+                : prev[book.id]?.views ?? baseViews + 1,
+            loves:
+              typeof data.loves === 'number'
+                ? data.loves
+                : prev[book.id]?.loves ?? baseLoves,
+          },
+        }));
+      }
+    } catch {
+      // Optimistic count kept in UI
+    }
+  };
+
+  const handleToggleLove = async (book: BookItem) => {
+    const wasLoved = Boolean(lovedBookIds[book.id]);
+    const nextLoved = !wasLoved;
+    const baseViews = getBookViews(book);
+    const currentLoves = getBookLoves(book);
+    const optimisticLoves = Math.max(0, currentLoves + (nextLoved ? 1 : -1));
+
+    setLovedBookIds((prev) => {
+      const updated = {...prev, [book.id]: nextLoved};
+      if (!nextLoved) {
+        delete updated[book.id];
+      }
+      writeLocalJson(LOVED_BOOKS_KEY, updated);
+      return updated;
+    });
+
+    setEngagementMap((prev) => ({
+      ...prev,
+      [book.id]: {
+        views: prev[book.id]?.views ?? baseViews,
+        loves: optimisticLoves,
+      },
+    }));
+
+    try {
+      const res = await fetch('/api/engagement', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          bookId: book.id,
+          action: nextLoved ? 'love' : 'unlove',
+        }),
+      });
+      if (res.ok) {
+        const data = (await res.json()) as {views?: number; loves?: number};
+        setEngagementMap((prev) => ({
+          ...prev,
+          [book.id]: {
+            views:
+              typeof data.views === 'number'
+                ? Math.max(data.views, prev[book.id]?.views ?? 0)
+                : prev[book.id]?.views ?? baseViews,
+            loves:
+              typeof data.loves === 'number'
+                ? Math.max(0, data.loves)
+                : optimisticLoves,
+          },
+        }));
+      }
+    } catch {
+      // Optimistic count kept in UI
+    }
+  };
+
+  const openBookPreview = (book: BookItem) => {
+    setSelectedBook(book);
+    void recordBookView(book);
+  };
+
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -603,6 +741,13 @@ export default function WorldBookRecords({
       );
       if (Object.keys(savedUnlocked).length > 0) {
         setUnlockedBookIds(savedUnlocked);
+      }
+      const savedLoved = readLocalJson<Record<string, boolean>>(
+        LOVED_BOOKS_KEY,
+        {},
+      );
+      if (Object.keys(savedLoved).length > 0) {
+        setLovedBookIds(savedLoved);
       }
     });
     return () => {
@@ -712,6 +857,7 @@ export default function WorldBookRecords({
       if (typeof window !== 'undefined') {
         setTimeout(() => {
           void refreshModerationStatuses();
+          void refreshEngagementCounts();
         }, 0);
       }
 
@@ -813,6 +959,7 @@ export default function WorldBookRecords({
       if (document.visibilityState === 'visible') {
         loadCatalog();
         refreshModerationStatuses();
+        refreshEngagementCounts();
       }
     };
     window.addEventListener('focus', refreshOnFocus);
@@ -866,6 +1013,7 @@ export default function WorldBookRecords({
   const booksWithStatus = useMemo(() => {
     return books.map((book) => {
       const mod = moderationMap[book.id];
+      const eng = engagementMap[book.id];
       const status: BookModerationStatus = mod?.status || book.status || 'approved';
       const rejectionReason =
         status === 'rejected'
@@ -875,9 +1023,11 @@ export default function WorldBookRecords({
         ...book,
         status,
         rejectionReason,
+        viewsCount: Math.max(book.viewsCount || 0, eng?.views ?? 0),
+        lovesCount: eng ? Math.max(0, eng.loves) : Math.max(0, book.lovesCount || 0),
       };
     });
-  }, [books, moderationMap]);
+  }, [books, moderationMap, engagementMap]);
 
   const myPublishedBooks = useMemo(() => {
     if (!signedInUser) return [];
@@ -2528,11 +2678,11 @@ export default function WorldBookRecords({
                 {filteredBooks.map((book) => (
                   <article
                     key={book.id}
-                    onClick={() => setSelectedBook(book)}
+                    onClick={() => openBookPreview(book)}
                     onKeyDown={(e) => {
                       if (e.key === 'Enter' || e.key === ' ') {
                         e.preventDefault();
-                        setSelectedBook(book);
+                        openBookPreview(book);
                       }
                     }}
                     tabIndex={0}
@@ -2540,6 +2690,34 @@ export default function WorldBookRecords({
                     aria-label={`Read preview of ${book.title} by ${book.author}`}
                     className="bg-[#141417] border border-[#292621] rounded-[13px] p-2.5 sm:p-[13px] transition duration-200 hover:-translate-y-1 hover:border-[#806633] cursor-pointer focus-visible:outline-2 focus-visible:outline-[#d8b35d] flex flex-col"
                   >
+                    <div className="flex items-center justify-between text-[11px] text-[#c8c2b6] mb-1.5 px-0.5 tabular-nums">
+                      <span
+                        className="inline-flex items-center gap-1"
+                        title={`${book.viewsCount || 0} views`}
+                      >
+                        <Eye className="w-3.5 h-3.5 text-[#d8b35d] shrink-0" />
+                        <span>{(book.viewsCount || 0).toLocaleString()}</span>
+                      </span>
+                      <span
+                        className="inline-flex items-center gap-1"
+                        title={`${book.lovesCount || 0} love reacts`}
+                      >
+                        <Heart
+                          className={`w-3.5 h-3.5 shrink-0 ${
+                            lovedBookIds[book.id]
+                              ? 'text-rose-500 fill-rose-500'
+                              : 'text-rose-400'
+                          }`}
+                        />
+                        <span
+                          className={
+                            lovedBookIds[book.id] ? 'text-rose-300 font-semibold' : ''
+                          }
+                        >
+                          {(book.lovesCount || 0).toLocaleString()}
+                        </span>
+                      </span>
+                    </div>
                     <div
                       className={`aspect-[2/3] w-full rounded-[7px] flex flex-col justify-between shadow-[inset_5px_0_rgba(255,255,255,0.08)] relative overflow-hidden ${COVER_GRADIENTS[book.coverVariant]} ${
                         book.coverImageUrl && !bookCoverErrors[book.id]
@@ -2973,13 +3151,13 @@ export default function WorldBookRecords({
                         key={book.id}
                         onClick={() => {
                           setProfileModalOpen(false);
-                          setSelectedBook(book);
+                          openBookPreview(book);
                         }}
                         onKeyDown={(e) => {
                           if (e.key === 'Enter' || e.key === ' ') {
                             e.preventDefault();
                             setProfileModalOpen(false);
-                            setSelectedBook(book);
+                            openBookPreview(book);
                           }
                         }}
                         tabIndex={0}
@@ -2987,6 +3165,36 @@ export default function WorldBookRecords({
                         aria-label={`Read preview of ${book.title}`}
                         className="bg-[#0d0d10] border border-[#292621] rounded-[13px] p-2.5 sm:p-3 transition duration-200 hover:-translate-y-1 hover:border-[#806633] cursor-pointer focus-visible:outline-2 focus-visible:outline-[#d8b35d] flex flex-col justify-between"
                       >
+                        <div className="flex items-center justify-between text-[11px] text-[#c8c2b6] mb-1.5 px-0.5 tabular-nums">
+                          <span
+                            className="inline-flex items-center gap-1"
+                            title={`${book.viewsCount || 0} views`}
+                          >
+                            <Eye className="w-3.5 h-3.5 text-[#d8b35d] shrink-0" />
+                            <span>{(book.viewsCount || 0).toLocaleString()}</span>
+                          </span>
+                          <span
+                            className="inline-flex items-center gap-1"
+                            title={`${book.lovesCount || 0} love reacts`}
+                          >
+                            <Heart
+                              className={`w-3.5 h-3.5 shrink-0 ${
+                                lovedBookIds[book.id]
+                                  ? 'text-rose-500 fill-rose-500'
+                                  : 'text-rose-400'
+                              }`}
+                            />
+                            <span
+                              className={
+                                lovedBookIds[book.id]
+                                  ? 'text-rose-300 font-semibold'
+                                  : ''
+                              }
+                            >
+                              {(book.lovesCount || 0).toLocaleString()}
+                            </span>
+                          </span>
+                        </div>
                         <div
                           className={`aspect-[2/3] w-full rounded-[7px] flex flex-col justify-between shadow-[inset_5px_0_rgba(255,255,255,0.08)] relative overflow-hidden ${COVER_GRADIENTS[book.coverVariant]} ${
                             book.coverImageUrl && !bookCoverErrors[book.id]
@@ -3756,9 +3964,37 @@ export default function WorldBookRecords({
                   >
                     {selectedBook.title}
                   </h2>
-                  <p className="text-[#a7a3a0] text-[13px] m-0 mb-3">
+                  <p className="text-[#a7a3a0] text-[13px] m-0 mb-2.5">
                     by {selectedBook.author}
                   </p>
+                  <div className="flex flex-wrap items-center justify-center sm:justify-start gap-2.5 mb-3">
+                    <span className="inline-flex items-center gap-1.5 rounded-[8px] border border-[#2c2821] bg-[#101013] px-2.5 py-1.5 text-[12px] text-[#d2cec5] tabular-nums">
+                      <Eye className="w-3.5 h-3.5 text-[#d8b35d]" />
+                      <span>{getBookViews(selectedBook).toLocaleString()} views</span>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => void handleToggleLove(selectedBook)}
+                      aria-pressed={Boolean(lovedBookIds[selectedBook.id])}
+                      className={`inline-flex items-center gap-1.5 rounded-[8px] border px-3 py-1.5 text-[12px] font-bold tabular-nums cursor-pointer transition-colors min-h-[36px] ${
+                        lovedBookIds[selectedBook.id]
+                          ? 'border-rose-500/70 bg-rose-500/15 text-rose-300 hover:bg-rose-500/20'
+                          : 'border-[#3a3326] bg-[#101013] text-[#f7f4ed] hover:border-rose-400/70 hover:text-rose-200'
+                      }`}
+                    >
+                      <Heart
+                        className={`w-3.5 h-3.5 shrink-0 ${
+                          lovedBookIds[selectedBook.id]
+                            ? 'text-rose-500 fill-rose-500'
+                            : 'text-rose-400'
+                        }`}
+                      />
+                      <span>
+                        {lovedBookIds[selectedBook.id] ? 'Loved' : 'Love'} ·{' '}
+                        {getBookLoves(selectedBook).toLocaleString()}
+                      </span>
+                    </button>
+                  </div>
                   <p className="text-[#d2cec5] text-[13.5px] leading-relaxed m-0 mb-2 sm:mb-4 text-left">
                     {selectedBook.synopsis}
                   </p>
@@ -3819,6 +4055,7 @@ export default function WorldBookRecords({
                             const targetBook = selectedBook;
                             setPdfPreviewOpen(false);
                             setSelectedBook(null);
+                            setReaderPdfZoom(1);
                             setReaderBook(targetBook);
                           }}
                           className="inline-flex items-center gap-1.5 border border-[#d8b35d] rounded-[8px] px-3 py-1.5 text-[12px] font-bold text-[#d8b35d] bg-transparent hover:bg-[#d8b35d]/10 cursor-pointer transition-colors"
@@ -3922,6 +4159,7 @@ export default function WorldBookRecords({
                       const targetBook = selectedBook;
                       setPdfPreviewOpen(false);
                       setSelectedBook(null);
+                      setReaderPdfZoom(1);
                       setReaderBook(targetBook);
                     }}
                     className="flex-1 sm:flex-initial inline-flex items-center justify-center gap-1.5 border border-[#d8b35d] rounded-[9px] px-4 py-2 text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] font-bold text-[13px] cursor-pointer transition-colors min-h-[42px]"
@@ -3942,7 +4180,7 @@ export default function WorldBookRecords({
         )}
       </AnimatePresence>
 
-      {/* Full-Screen Book Reader (Full-page PDF only when reading PDF) */}
+      {/* Full-Screen Book Reader (Unified Top Bar + Full-Area PDF or Text Below) */}
       <AnimatePresence>
         {readerBook &&
           (() => {
@@ -3957,6 +4195,10 @@ export default function WorldBookRecords({
               isAuthorOwner ||
               Boolean(unlockedBookIds[readerBook.id]);
             const isFullPagePdf = Boolean(hasFullAccess && activeReaderPdfSource);
+            const activePdfPages =
+              readerPdfPageInfo?.bookId === readerBook.id
+                ? readerPdfPageInfo
+                : null;
 
             return (
               <motion.div
@@ -3965,201 +4207,271 @@ export default function WorldBookRecords({
                 exit={{opacity: 0}}
                 transition={{duration: 0.16}}
                 className={`fixed inset-0 z-40 flex flex-col ${
-                  isFullPagePdf
-                    ? 'bg-[#111114] text-[#efeadd]'
-                    : readerTheme === 'sepia'
-                      ? 'bg-[#f4ecd8] text-[#2b2118]'
-                      : readerTheme === 'light'
-                        ? 'bg-[#faf9f6] text-[#1a1a1c]'
-                        : 'bg-[#0b0b0d] text-[#efeadd]'
+                  readerTheme === 'sepia'
+                    ? 'bg-[#f4ecd8] text-[#2b2118]'
+                    : readerTheme === 'light'
+                      ? 'bg-[#faf9f6] text-[#1a1a1c]'
+                      : 'bg-[#0b0b0d] text-[#efeadd]'
                 }`}
                 role="dialog"
                 aria-modal="true"
                 aria-label={`Reading ${readerBook.title}`}
               >
-                {isFullPagePdf && activeReaderPdfSource ? (
-                  <PdfCanvasReader
-                    fileUrl={activeReaderPdfSource}
-                    title={readerBook.title}
-                    fullPage
-                    onClose={() => setReaderBook(null)}
-                    onDownload={() => handleDownloadBookFile(readerBook)}
-                    onScrollProgress={(pct) => {
-                      setReadingProgress((prev) => {
-                        if (prev[readerBook.id] === pct) return prev;
-                        const next = {...prev, [readerBook.id]: pct};
-                        writeLocalJson(READING_PROGRESS_KEY, next);
-                        return next;
-                      });
-                    }}
-                  />
-                ) : (
-                  <>
-                    {/* Reader Top Controls Bar */}
-                    <div
-                      className={`border-b px-3 sm:px-6 py-2.5 sm:py-3 flex items-center justify-between gap-2.5 sm:gap-3 flex-wrap ${
-                        readerTheme === 'sepia'
-                          ? 'border-[#dfd2b5] bg-[#ede2c8]'
-                          : readerTheme === 'light'
-                            ? 'border-[#e5e2dc] bg-[#ffffff]'
-                            : 'border-[#2b2720] bg-[#121215]'
+                {/* Reader Top Controls Bar */}
+                <div
+                  className={`border-b px-2.5 sm:px-6 py-2 sm:py-3 flex items-center justify-between gap-2 sm:gap-3 shrink-0 ${
+                    readerTheme === 'sepia'
+                      ? 'border-[#dfd2b5] bg-[#ede2c8]'
+                      : readerTheme === 'light'
+                        ? 'border-[#e5e2dc] bg-[#ffffff]'
+                        : 'border-[#2b2720] bg-[#121215]'
+                  }`}
+                >
+                  <div className="flex items-center gap-2 sm:gap-3 min-w-0 flex-1">
+                    <button
+                      type="button"
+                      onClick={() => setReaderBook(null)}
+                      aria-label="Back"
+                      className={`inline-flex items-center gap-1 rounded-[8px] px-2 sm:px-3 py-1.5 text-[12px] sm:text-[12.5px] font-semibold border cursor-pointer transition-colors shrink-0 min-h-[34px] ${
+                        readerTheme === 'dark'
+                          ? 'border-[#3a3326] text-[#f7f4ed] hover:border-[#d8b35d]'
+                          : 'border-[#c8bba0] text-inherit hover:border-[#9e7d32]'
                       }`}
                     >
-                      <div className="flex items-center gap-2.5 sm:gap-3 min-w-0 flex-1">
-                        <button
-                          type="button"
-                          onClick={() => setReaderBook(null)}
-                          className={`inline-flex items-center gap-1.5 rounded-[8px] px-2.5 sm:px-3 py-1.5 text-[12.5px] font-semibold border cursor-pointer transition-colors shrink-0 min-h-[36px] ${
-                            readerTheme === 'dark'
-                              ? 'border-[#3a3326] text-[#f7f4ed] hover:border-[#d8b35d]'
-                              : 'border-[#c8bba0] text-inherit hover:border-[#9e7d32]'
-                          }`}
-                        >
-                          <ArrowLeft className="w-4 h-4" />
-                          <span>Back</span>
-                        </button>
-                        <div className="min-w-0">
-                          <div className="font-serif text-[15px] sm:text-[18px] truncate font-medium">
-                            {readerBook.title}
-                          </div>
-                          <div className="text-[11px] sm:text-[11.5px] opacity-75 truncate">
-                            by {readerBook.author} · {readerBook.category} ·{' '}
-                            <span className="tabular-nums">
-                              {readingProgress[readerBook.id] || 0}% read
-                            </span>
-                          </div>
-                        </div>
+                      <ArrowLeft className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+                      <span className="hidden min-[400px]:inline">Back</span>
+                    </button>
+                    <div className="min-w-0">
+                      <div className="font-serif text-[14px] sm:text-[18px] truncate font-medium leading-tight">
+                        {readerBook.title}
                       </div>
-
-                      <div className="flex items-center gap-2 flex-wrap">
-                        {/* Font Size Controls */}
-                        <div
-                          className={`inline-flex items-center rounded-[8px] border overflow-hidden ${
-                            readerTheme === 'dark' ? 'border-[#3a3326]' : 'border-[#c8bba0]'
-                          }`}
-                        >
-                          <button
-                            type="button"
-                            aria-label="Decrease text size"
-                            onClick={() => {
-                              const next = Math.max(15, readerFontSize - 1);
-                              setReaderFontSize(next);
-                              writeLocalJson(READER_PREFS_KEY, {
-                                theme: readerTheme,
-                                fontSize: next,
-                              });
-                            }}
-                            className="px-2.5 py-1.5 hover:bg-[#d8b35d]/20 cursor-pointer bg-transparent border-0 text-inherit"
-                          >
-                            <Minus className="w-3.5 h-3.5" />
-                          </button>
-                          <span className="px-2 text-[11px] font-bold tabular-nums opacity-85">
-                            {readerFontSize}px
-                          </span>
-                          <button
-                            type="button"
-                            aria-label="Increase text size"
-                            onClick={() => {
-                              const next = Math.min(24, readerFontSize + 1);
-                              setReaderFontSize(next);
-                              writeLocalJson(READER_PREFS_KEY, {
-                                theme: readerTheme,
-                                fontSize: next,
-                              });
-                            }}
-                            className="px-2.5 py-1.5 hover:bg-[#d8b35d]/20 cursor-pointer bg-transparent border-0 text-inherit"
-                          >
-                            <Plus className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
-
-                        {/* Paper Theme Switcher */}
-                        <div
-                          className={`inline-flex items-center rounded-[8px] border p-0.5 gap-0.5 ${
-                            readerTheme === 'dark' ? 'border-[#3a3326]' : 'border-[#c8bba0]'
-                          }`}
-                        >
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setReaderTheme('dark');
-                              writeLocalJson(READER_PREFS_KEY, {
-                                theme: 'dark',
-                                fontSize: readerFontSize,
-                              });
-                            }}
-                            title="Night mode"
-                            className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-[6px] text-[11px] font-semibold cursor-pointer border-0 transition-colors ${
-                              readerTheme === 'dark'
-                                ? 'bg-[#d8b35d] text-[#16130c]'
-                                : 'bg-transparent text-inherit opacity-75 hover:opacity-100'
-                            }`}
-                          >
-                            <Moon className="w-3 h-3" />
-                            <span className="hidden sm:inline">Night</span>
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setReaderTheme('sepia');
-                              writeLocalJson(READER_PREFS_KEY, {
-                                theme: 'sepia',
-                                fontSize: readerFontSize,
-                              });
-                            }}
-                            title="Sepia paper mode"
-                            className={`px-2.5 py-1 rounded-[6px] text-[11px] font-semibold cursor-pointer border-0 transition-colors ${
-                              readerTheme === 'sepia'
-                                ? 'bg-[#b38734] text-[#fffaf0]'
-                                : 'bg-transparent text-inherit opacity-75 hover:opacity-100'
-                            }`}
-                          >
-                            Sepia
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setReaderTheme('light');
-                              writeLocalJson(READER_PREFS_KEY, {
-                                theme: 'light',
-                                fontSize: readerFontSize,
-                              });
-                            }}
-                            title="Day mode"
-                            className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-[6px] text-[11px] font-semibold cursor-pointer border-0 transition-colors ${
-                              readerTheme === 'light'
-                                ? 'bg-[#1f1e1c] text-white'
-                                : 'bg-transparent text-inherit opacity-75 hover:opacity-100'
-                            }`}
-                          >
-                            <Sun className="w-3 h-3" />
-                            <span className="hidden sm:inline">Day</span>
-                          </button>
-                        </div>
-
-                        {readerBook.bookFileUrl && (
-                          <button
-                            type="button"
-                            onClick={() => handleDownloadBookFile(readerBook)}
-                            className="inline-flex items-center gap-1.5 border border-[#d8b35d] rounded-[8px] px-3 py-1.5 text-[12px] font-bold text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] cursor-pointer transition-colors"
-                          >
-                            <Download className="w-3.5 h-3.5" />
-                            <span className="hidden sm:inline">Download</span>
-                          </button>
-                        )}
+                      <div className="text-[10.5px] sm:text-[11.5px] opacity-75 truncate">
+                        by {readerBook.author}
+                        {isFullPagePdf && activePdfPages
+                          ? ` · ${activePdfPages.page}/${activePdfPages.total}`
+                          : ` · ${readingProgress[readerBook.id] || 0}%`}
                       </div>
                     </div>
+                  </div>
 
-                    {/* Thin Reading Progress Bar */}
-                    <div className="h-[3px] w-full bg-black/15 shrink-0">
-                      <div
-                        className="h-full bg-[#d8b35d] transition-all duration-150"
-                        style={{
-                          width: `${readingProgress[readerBook.id] || 0}%`,
-                        }}
+                  <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+                    {/* Views & Love React inside Reader */}
+                    <span
+                      className="hidden md:inline-flex items-center gap-1 text-[11.5px] opacity-80 tabular-nums px-1"
+                      title={`${getBookViews(readerBook)} views`}
+                    >
+                      <Eye className="w-3.5 h-3.5 text-[#d8b35d]" />
+                      <span>{getBookViews(readerBook).toLocaleString()}</span>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => void handleToggleLove(readerBook)}
+                      aria-label={
+                        lovedBookIds[readerBook.id]
+                          ? 'Remove love react'
+                          : 'Love this book'
+                      }
+                      aria-pressed={Boolean(lovedBookIds[readerBook.id])}
+                      className={`inline-flex items-center gap-1 rounded-[8px] border px-2 sm:px-2.5 py-1.5 text-[11.5px] font-bold tabular-nums cursor-pointer transition-colors shrink-0 min-h-[34px] ${
+                        lovedBookIds[readerBook.id]
+                          ? 'border-rose-500/70 bg-rose-500/15 text-rose-400'
+                          : readerTheme === 'dark'
+                            ? 'border-[#3a3326] text-inherit hover:border-rose-400/70'
+                            : 'border-[#c8bba0] text-inherit hover:border-rose-500/70'
+                      }`}
+                    >
+                      <Heart
+                        className={`w-3.5 h-3.5 shrink-0 ${
+                          lovedBookIds[readerBook.id]
+                            ? 'text-rose-500 fill-rose-500'
+                            : 'text-rose-400'
+                        }`}
                       />
+                      <span>{getBookLoves(readerBook).toLocaleString()}</span>
+                    </button>
+
+                    {/* PDF Zoom Controls OR Font Size Controls */}
+                    <div
+                      className={`inline-flex items-center rounded-[8px] border overflow-hidden ${
+                        readerTheme === 'dark' ? 'border-[#3a3326]' : 'border-[#c8bba0]'
+                      }`}
+                    >
+                      <button
+                        type="button"
+                        aria-label={isFullPagePdf ? 'Zoom out PDF' : 'Decrease text size'}
+                        onClick={() => {
+                          if (isFullPagePdf) {
+                            setReaderPdfZoom((z) =>
+                              Math.max(0.7, Number((z - 0.15).toFixed(2))),
+                            );
+                          } else {
+                            const next = Math.max(15, readerFontSize - 1);
+                            setReaderFontSize(next);
+                            writeLocalJson(READER_PREFS_KEY, {
+                              theme: readerTheme,
+                              fontSize: next,
+                            });
+                          }
+                        }}
+                        className="px-2 sm:px-2.5 py-1.5 hover:bg-[#d8b35d]/20 cursor-pointer bg-transparent border-0 text-inherit"
+                      >
+                        <Minus className="w-3.5 h-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (isFullPagePdf) setReaderPdfZoom(1);
+                        }}
+                        className="px-1.5 sm:px-2 text-[11px] font-bold tabular-nums opacity-85 bg-transparent border-0 text-inherit cursor-pointer"
+                        title={isFullPagePdf ? 'Reset zoom' : 'Text size'}
+                      >
+                        {isFullPagePdf
+                          ? `${Math.round(readerPdfZoom * 100)}%`
+                          : `${readerFontSize}px`}
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={isFullPagePdf ? 'Zoom in PDF' : 'Increase text size'}
+                        onClick={() => {
+                          if (isFullPagePdf) {
+                            setReaderPdfZoom((z) =>
+                              Math.min(2, Number((z + 0.15).toFixed(2))),
+                            );
+                          } else {
+                            const next = Math.min(24, readerFontSize + 1);
+                            setReaderFontSize(next);
+                            writeLocalJson(READER_PREFS_KEY, {
+                              theme: readerTheme,
+                              fontSize: next,
+                            });
+                          }
+                        }}
+                        className="px-2 sm:px-2.5 py-1.5 hover:bg-[#d8b35d]/20 cursor-pointer bg-transparent border-0 text-inherit"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                      </button>
                     </div>
 
+                    {/* Paper Theme Switcher */}
+                    <div
+                      className={`inline-flex items-center rounded-[8px] border p-0.5 gap-0.5 ${
+                        readerTheme === 'dark' ? 'border-[#3a3326]' : 'border-[#c8bba0]'
+                      }`}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setReaderTheme('dark');
+                          writeLocalJson(READER_PREFS_KEY, {
+                            theme: 'dark',
+                            fontSize: readerFontSize,
+                          });
+                        }}
+                        title="Night mode"
+                        aria-label="Night mode"
+                        className={`inline-flex items-center gap-1 px-2 sm:px-2.5 py-1 rounded-[6px] text-[11px] font-semibold cursor-pointer border-0 transition-colors ${
+                          readerTheme === 'dark'
+                            ? 'bg-[#d8b35d] text-[#16130c]'
+                            : 'bg-transparent text-inherit opacity-75 hover:opacity-100'
+                        }`}
+                      >
+                        <Moon className="w-3 h-3" />
+                        <span className="hidden sm:inline">Night</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setReaderTheme('sepia');
+                          writeLocalJson(READER_PREFS_KEY, {
+                            theme: 'sepia',
+                            fontSize: readerFontSize,
+                          });
+                        }}
+                        title="Sepia paper mode"
+                        className={`px-2 sm:px-2.5 py-1 rounded-[6px] text-[11px] font-semibold cursor-pointer border-0 transition-colors ${
+                          readerTheme === 'sepia'
+                            ? 'bg-[#b38734] text-[#fffaf0]'
+                            : 'bg-transparent text-inherit opacity-75 hover:opacity-100'
+                        }`}
+                      >
+                        Sepia
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setReaderTheme('light');
+                          writeLocalJson(READER_PREFS_KEY, {
+                            theme: 'light',
+                            fontSize: readerFontSize,
+                          });
+                        }}
+                        title="Day mode"
+                        aria-label="Day mode"
+                        className={`inline-flex items-center gap-1 px-2 sm:px-2.5 py-1 rounded-[6px] text-[11px] font-semibold cursor-pointer border-0 transition-colors ${
+                          readerTheme === 'light'
+                            ? 'bg-[#1f1e1c] text-white'
+                            : 'bg-transparent text-inherit opacity-75 hover:opacity-100'
+                        }`}
+                      >
+                        <Sun className="w-3 h-3" />
+                        <span className="hidden sm:inline">Day</span>
+                      </button>
+                    </div>
+
+                    {readerBook.bookFileUrl && (
+                      <button
+                        type="button"
+                        onClick={() => handleDownloadBookFile(readerBook)}
+                        title="Download file"
+                        aria-label="Download file"
+                        className="hidden min-[430px]:inline-flex items-center gap-1.5 border border-[#d8b35d] rounded-[8px] px-2.5 sm:px-3 py-1.5 text-[12px] font-bold text-[#16130c] bg-[#d8b35d] hover:bg-[#f2d58b] cursor-pointer transition-colors min-h-[32px]"
+                      >
+                        <Download className="w-3.5 h-3.5" />
+                        <span className="hidden sm:inline">Download</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Thin Reading Progress Bar */}
+                <div className="h-[3px] w-full bg-black/15 shrink-0">
+                  <div
+                    className="h-full bg-[#d8b35d] transition-all duration-150"
+                    style={{
+                      width: `${readingProgress[readerBook.id] || 0}%`,
+                    }}
+                  />
+                </div>
+
+                {isFullPagePdf && activeReaderPdfSource ? (
+                  <div className="flex-1 min-h-0 flex flex-col">
+                    <PdfCanvasReader
+                      fileUrl={activeReaderPdfSource}
+                      title={readerBook.title}
+                      theme={readerTheme}
+                      fullPage
+                      hideToolbar
+                      controlledZoom={readerPdfZoom}
+                      onDownload={() => handleDownloadBookFile(readerBook)}
+                      onPageChange={(page, total) =>
+                        setReaderPdfPageInfo({
+                          bookId: readerBook.id,
+                          page,
+                          total,
+                        })
+                      }
+                      onScrollProgress={(pct) => {
+                        setReadingProgress((prev) => {
+                          if (prev[readerBook.id] === pct) return prev;
+                          const next = {...prev, [readerBook.id]: pct};
+                          writeLocalJson(READING_PROGRESS_KEY, next);
+                          return next;
+                        });
+                      }}
+                    />
+                  </div>
+                ) : (
+                  <>
                     {(() => {
                       const textSource =
                         (hasFullAccess && activeReaderFileText) ||
@@ -4200,9 +4512,25 @@ export default function WorldBookRecords({
                       <h1 className="font-serif text-[32px] sm:text-[42px] leading-[1.12] m-0 mb-2 font-normal">
                         {readerBook.title}
                       </h1>
-                      <p className="text-[14px] opacity-75 m-0 mb-4">
+                      <p className="text-[14px] opacity-75 m-0 mb-3">
                         by {readerBook.author}
                       </p>
+                      <div className="flex items-center justify-center gap-3 text-[12px] opacity-80 mb-4 tabular-nums">
+                        <span className="inline-flex items-center gap-1">
+                          <Eye className="w-3.5 h-3.5 text-[#c49b3e]" />
+                          <span>{getBookViews(readerBook).toLocaleString()} views</span>
+                        </span>
+                        <span className="inline-flex items-center gap-1">
+                          <Heart
+                            className={`w-3.5 h-3.5 ${
+                              lovedBookIds[readerBook.id]
+                                ? 'text-rose-500 fill-rose-500'
+                                : 'text-rose-400'
+                            }`}
+                          />
+                          <span>{getBookLoves(readerBook).toLocaleString()} loves</span>
+                        </span>
+                      </div>
                       <p className="text-[14.5px] opacity-85 max-w-[54ch] mx-auto leading-relaxed m-0">
                         {readerBook.synopsis}
                       </p>
